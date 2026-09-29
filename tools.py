@@ -27,5 +27,3 @@ tools_map = {
     "edit_file": edit_file,
     "run_test": run_test
 }
-if __name__ == "__main__":
-    print(run_test())
