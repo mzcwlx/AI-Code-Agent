@@ -1,7 +1,9 @@
-from bug import add, subtract
+from bug import calculate_discount, calculate_total
 
-def test_add():
-    assert add(2, 3) == 5
 
-def test_subtract():
-    assert subtract(5, 3) == 2
+def test_calculate_discount():
+    assert calculate_discount(100, 0.2) == 80
+
+
+def test_calculate_total():
+    assert calculate_total(100, 0.2) == 80
