@@ -249,14 +249,9 @@ for _ in range(max_rounds):
                             tests_passed = False
                     else:
                         tests_passed = False
-
                     if edited:
                         edited = False
                         tested_after_edit = True
-
-                if edited:
-                    edited = False
-                    tested_after_edit = True
                 messages.append({
                     "role": "tool",
                     "content": str(result),

@@ -102,7 +102,8 @@ def retrieve_code(query, index, all_chunks, top_k=5):
 
     faiss.normalize_L2(query_vector)
 
-    scores, indices = index.search(query_vector, top_k)
+    k = min(top_k, len(all_chunks))
+    scores, indices = index.search(query_vector, k)
 
     results = []
 
