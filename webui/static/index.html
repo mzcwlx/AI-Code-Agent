@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CodeDoctor — Autonomous Code Repair Agent</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">◈</div>
+      <div>
+        <div class="brand-name">CodeDoctor</div>
+        <div class="brand-sub">Autonomous Code Repair Agent</div>
+      </div>
+    </div>
+    <div class="status" id="agentStatus"><span class="dot" id="statusDot"></span> <span id="statusText">AGENT IDLE</span></div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section>
+        <div class="section-title">WORKSPACE</div>
+        <div class="project" id="wsProject">—</div>
+        <div class="tree" id="wsTree">等待任务…</div>
+      </section>
+
+      <section>
+        <div class="section-title">AGENT TOOLS</div>
+        <div class="tool">⌕ Code RAG</div>
+        <div class="tool">▤ Read File</div>
+        <div class="tool">✎ Replace Lines</div>
+        <div class="tool">✓ Syntax Check</div>
+        <div class="tool">⚗ Pytest</div>
+      </section>
+
+      <section>
+        <div class="section-title">TASK</div>
+        <div class="task-id" id="taskId">—</div>
+      </section>
+    </aside>
+
+    <section class="content">
+      <section class="card intake-card">
+        <div class="card-head">
+          <span>NEW REPAIR TASK</span>
+          <span class="muted">ZIP / 单文件 / GitHub Issue</span>
+        </div>
+        <div class="intake">
+          <div class="tabs">
+            <button class="tab active" data-tab="upload">上传项目</button>
+            <button class="tab" data-tab="issue">GitHub Issue</button>
+            <button class="tab" data-tab="preset">预置任务</button>
+          </div>
+
+          <div class="tab-pane active" id="pane-upload">
+            <div class="dropzone" id="dropzone">
+              <div class="dz-main">拖放 ZIP 或单个源文件到此处</div>
+              <div class="dz-sub">或点击选择文件 · ZIP 将自动解压为 Workspace</div>
+              <input type="file" id="fileInput" hidden>
+            </div>
+            <div class="file-chip" id="fileChip" hidden></div>
+            <label class="field-label">Bug 描述</label>
+            <textarea id="bugDesc" rows="3" placeholder="描述要修复的缺陷：预期行为、实际行为、复现方式…"></textarea>
+          </div>
+
+          <div class="tab-pane" id="pane-issue">
+            <label class="field-label">Issue 链接</label>
+            <input id="issueUrl" type="text" placeholder="https://github.com/psf/requests/issues/6628">
+            <label class="field-label">补充说明（可选）</label>
+            <textarea id="issueNote" rows="3" placeholder="额外上下文、复现条件等"></textarea>
+          </div>
+
+          <div class="tab-pane" id="pane-preset">
+            <label class="field-label">选择任务</label>
+            <select id="presetSelect"></select>
+            <label class="check-row">
+              <input type="checkbox" id="resetCheck" checked>
+              从干净的初始状态开始（git reset，保留虚拟环境）
+            </label>
+          </div>
+
+          <button id="prepareBtn" class="secondary">准备任务</button>
+          <span id="prepareMsg" class="prepare-msg"></span>
+        </div>
+      </section>
+
+      <div class="hero">
+        <div>
+          <div class="eyebrow">REPAIR SESSION</div>
+          <h1 id="heroTitle">创建或选择一个任务开始修复</h1>
+          <p id="heroSub">Agent 自主分析、检索、修改并验证项目。</p>
+        </div>
+        <button id="startBtn" disabled>▶ Start Repair</button>
+      </div>
+
+      <div class="grid">
+        <section class="card workflow-card">
+          <div class="card-head">
+            <span>AGENT WORKFLOW</span>
+            <span id="round">ROUND —</span>
+          </div>
+          <div class="phases" id="phases"></div>
+          <div id="workflow" class="workflow">
+            <div class="empty">Waiting for agent...</div>
+          </div>
+          <details class="rawlog">
+            <summary>完整运行日志</summary>
+            <pre id="rawLog"></pre>
+          </details>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><span>RETRIEVED CODE</span><span id="ragCount">—</span></div>
+          <div class="code-box"><pre id="ragCode">尚无检索结果</pre></div>
+        </section>
+      </div>
+
+      <section class="card diff-card">
+        <div class="card-head"><span>CODE DIFF</span><span id="diffFile">Waiting...</span></div>
+        <div class="diff" id="diffBox"><div class="empty">修复完成后显示真实 git diff</div></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <span>TEST RESULT</span>
+          <span id="testStatus" class="muted">NOT RUN</span>
+        </div>
+        <div class="test-summary">
+          <div><b id="passed">0</b><span>passed</span></div>
+          <div><b id="failed">0</b><span>failed</span></div>
+          <div><b id="validation">—</b><span>validation</span></div>
+          <div><b id="baseline">—</b><span>baseline</span></div>
+        </div>
+      </section>
+
+      <section class="card result-card" id="resultCard" hidden>
+        <div class="card-head">
+          <span>FINAL RESULT</span>
+          <span id="resultBadge"></span>
+        </div>
+        <div class="result-body">
+          <div id="resultText"></div>
+          <a id="downloadBtn" class="dl-btn" href="#" hidden>⬇ 下载修复后的项目 ZIP</a>
+        </div>
+      </section>
+    </section>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

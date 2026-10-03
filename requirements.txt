@@ -1,0 +1,12 @@
+# AI-Code-Agent 运行依赖
+# 安装：pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# ---- Agent Runtime 核心（agent.py / llm_client.py / code_rag.py）----
+zai-sdk>=0.2.3          # 智谱 GLM LLM 客户端（工具调用）
+numpy>=1.26             # Code RAG 向量计算
+faiss-cpu>=1.10         # Code RAG 向量检索（1.10+ 支持 numpy 2.x）
+
+# ---- Web UI（webui/server.py）----
+fastapi>=0.110          # API 服务层（Agent 的外壳，不含 Agent 逻辑）
+uvicorn>=0.29           # ASGI 服务器
+python-multipart>=0.0.9 # FastAPI 文件上传 / 表单解析
