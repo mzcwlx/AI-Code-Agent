@@ -1,7 +1,7 @@
 import json
 
 from llm_client import chat
-from tools import tools_map, set_workspace
+from tools import tools_map, set_workspace, cleanup_bug_validation
 from task_loader import get_task
 from workspace_manager import create_workspace
 
@@ -15,6 +15,10 @@ MAX_ROUNDS = 15
 edited = False
 tests_passed = False
 syntax_passed = False
+validation_created = False
+validation_baseline_confirmed = False
+validation_passed = False
+validation_failed = False
 
 # 当前修改后的文件
 last_edited_file = None
@@ -150,8 +154,8 @@ tools = [
                     "test_filter": {
                         "type": "string",
                         "description": (
-                            "可选。pytest -k 表达式，"
-                            "例如 pickle 或 json_decode。"
+                            "可选。pytest -k 表达式。"
+                            "应根据当前问题和项目测试实际情况填写。"
                             "不要填写 -v 等命令行参数。"
                         )
                     }
@@ -241,7 +245,59 @@ tools = [
                 "required": ["path"]
             }
         }
+    },
+    # --------------------------------------------------------
+    # create_bug_validation
+    # --------------------------------------------------------
+
+    {
+        "type": "function",
+        "function": {
+            "name": "create_bug_validation",
+            "description": (
+                "创建一个临时、通用的 Bug 回归验证测试。"
+                "test_code 必须是 pytest 测试函数的完整源码，"
+                "用于复现问题描述中的具体缺陷，并验证修复后的期望行为。"
+                "该测试存放在 .agent_validation 目录，不得修改项目 tests。"
+                "创建后必须先在未修改代码的状态运行一次，以确认 Bug 能复现；"
+                "然后修改代码，再次运行同一个验证。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "test_code": {
+                        "type": "string",
+                        "description": (
+                            "完整 pytest 测试文件源码。必须包含至少一个 test_ 开头的测试函数，"
+                            "断言应直接对应原始 Bug 的期望修复行为。"
+                        )
+                    }
+                },
+                "required": ["test_code"]
+            }
+        }
+    },
+
+    # --------------------------------------------------------
+    # run_bug_validation
+    # --------------------------------------------------------
+
+    {
+        "type": "function",
+        "function": {
+            "name": "run_bug_validation",
+            "description": (
+                "运行当前临时 Bug 回归验证。"
+                "第一次必须在修改代码前运行：若测试失败，说明原始 Bug 成功复现；"
+                "修改并通过语法检查、正常测试后，再次运行：若测试通过，说明该 Bug 已修复。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
     }
+
 ]
 
 
@@ -325,6 +381,8 @@ Bug 原因分析
 - replace_in_file
 - check_syntax
 - run_test
+- create_bug_validation
+- run_bug_validation
 
 必须通过真实工具完成工作。
 
@@ -335,6 +393,40 @@ Bug 原因分析
 - 声称已经修改代码但没有调用 replace_in_file
 - 声称测试通过但没有真实 run_test 结果
 - 根据自己的推理直接宣布任务成功
+
+============================================================
+四、通用 Bug 回归验证机制
+============================================================
+
+不要依赖任何针对具体仓库、Issue 编号、类名或 Bug 的硬编码检查。
+
+如果现有 pytest 已经直接覆盖原始 Bug，可以直接使用相关测试。
+如果现有测试不能证明原始 Bug 已被修复，则必须：
+
+1. 在修改代码之前，根据 problem statement 和真实代码创建一个临时 Bug 验证测试；
+2. 调用 create_bug_validation；
+3. 在任何代码修改之前调用 run_bug_validation；
+4. 如果验证测试失败，这是预期的“Bug 已复现”，必须记录为 baseline confirmed；
+5. 然后调用 replace_in_file 修改真实代码；
+6. check_syntax → run_test；
+7. 再次调用 run_bug_validation；
+8. 只有第二次 PASS 才能把原始 Bug 视为真正修复。
+
+临时验证测试：
+- 不得修改项目 tests；
+- 不得修改源代码；
+- 必须直接验证 problem statement 明确描述的失败行为；
+- 验证测试必须是“最小复现”，只断言 Issue 明确要求保持/恢复的行为；
+- 不得凭空增加未被 problem statement、现有测试或真实代码语义支持的断言；
+- 不得把错误消息的精确文本、内部属性、对象 repr、参数格式等当成验收条件，除非问题描述或现有测试明确要求；
+- 不得为了让测试通过而改变断言；
+- 不得在验证测试中引入与 Bug 无关的额外失败点，例如局部类、临时对象无法序列化、网络服务、外部资源等；
+- 对序列化/反序列化问题，优先验证“原操作能够成功完成 + 恢复后的对象类型/关键状态符合问题描述”，不要自行假设异常消息等细节；
+- 对异常修复问题，验证重点应是问题描述中的异常是否仍然发生，而不是自行重新定义异常的语义；
+- 必须使用真实项目代码，而不是模拟一个假的修复结果；
+- 创建验证测试后，在修改前运行它；如果出现与目标 Bug 无关的错误，应先修正验证测试本身，再确认 baseline。
+
+============================================================
 
 ============================================================
 三、严格工具真实性
@@ -436,58 +528,6 @@ retrieve_code
 
 如果已经阅读了直接相关代码，就不要继续寻找“更多相似代码”。
 
-尤其是问题描述已经明确指出：
-
-- pickle
-- __reduce__
-- MRO
-- JSONDecodeError
-
-等机制时，
-
-一旦你阅读：
-
-src/requests/exceptions.py
-
-并看到：
-
-JSONDecodeError
-
-就应该分析并修改。
-
-不能继续无休止搜索。
-
-============================================================
-六、当前任务的强制规则
-============================================================
-
-如果当前问题同时包含：
-
-pickle
-__reduce__
-MRO
-JSONDecodeError
-
-并且你已经读取：
-
-src/requests/exceptions.py
-
-那么：
-
-下一步必须调用：
-
-replace_in_file
-
-禁止：
-
-- 再次 retrieve_code
-- 重复搜索 JSONDecodeError
-- 重复搜索 pickle
-- 重复运行不能验证 Bug 的测试
-- 只描述修改方案
-
-你必须真正修改代码。
-
 ============================================================
 七、修改代码
 ============================================================
@@ -548,33 +588,13 @@ check_syntax
 
 run_test 的 test_filter 是 pytest -k 表达式。
 
-例如：
+测试选择必须根据当前 Workspace 的实际项目结构和当前 Bug 来决定。
+优先运行与修改文件、Bug 行为或相关模块直接对应的现有测试。
 
-pickle
+如果没有足够直接的现有测试，不得把一个无关测试的 PASS 当作 Bug 修复证据，
+应使用 create_bug_validation / run_bug_validation 建立直接的回归验证。
 
-或者：
-
-json_decode
-
-正确：
-
-{
-    "test_path": "tests/test_requests.py",
-    "test_filter": "pickle"
-}
-
-错误：
-
-{
-    "test_filter": "pickle -v"
-}
-
-不要把：
-
--v
---verbose
---maxfail
-等命令行参数放入 test_filter。
+不要把 -v、--verbose、--maxfail 等命令行参数放入 test_filter。
 
 ============================================================
 十、测试通过不等于 Bug 修复
@@ -594,15 +614,8 @@ run_test
 
 Bug 已经修复。
 
-如果原问题是：
-
-pickle.dumps
-+
-pickle.loads
-+
-JSONDecodeError
-
-那么最终测试应该尽可能直接覆盖这个场景。
+最终回归验证应该尽可能直接覆盖 problem statement 描述的失败行为，
+而不是只覆盖一个表面相关的函数或测试名称。
 
 如果已有测试与 Bug 没有直接关系：
 
@@ -688,6 +701,40 @@ run_test
 你的目标是：
 
 “真正修改 Workspace，并用测试证明修复有效”。
+
+============================================================
+十五、通用 Bug 回归验证
+============================================================
+
+当前 Workspace 使用通用的临时 Bug 回归验证机制。
+
+对于每一个需要修改源代码的 Bug 修复任务：
+1. 根据 problem statement 和真实源代码创建临时验证；
+2. 修改前运行验证，确认原始 Bug FAIL；
+3. 修改真实源代码；
+4. check_syntax；
+5. run_test；
+6. 再次运行同一个临时验证，必须 PASS。
+
+临时验证不得绑定任何固定仓库、Issue 编号、类名、函数名或文件路径。
+不得修改项目原有 tests。
+不得把无关 pytest 的 PASS 当作原始 Bug 已修复的证明。
+
+创建临时验证时必须先做“验收条件审查”：
+1. 从 problem statement 提取明确的失败行为；
+2. 只为这个失败行为设计最小复现；
+3. 每个 assert 都必须能说明它为什么来自 problem statement、现有测试或真实代码语义；
+4. 如果某个 assert 只是模型自己的猜测，删除它；
+5. 如果测试包含额外 fixture / mock / 临时类，必须确认它不会引入与目标 Bug 无关的失败；
+6. baseline FAIL 时必须检查 traceback，确认失败原因就是目标 Bug，而不是验证测试自身写错。
+
+尤其禁止：
+- 为了验证 pickle 而额外要求字符串完全相等；
+- 为了验证序列化而使用无法被 pickle 的局部类；
+- 为了验证异常而自行假设新的异常消息；
+这些都属于与目标 Bug 无关的过度断言，除非 problem statement 明确要求。
+
+
 """
 
 
@@ -710,6 +757,13 @@ messages = [
 当前任务 Workspace：
 
 {workspace}
+
+当前 Workspace 支持通用的临时 Bug 回归验证。
+
+本 Agent 不针对任何特定仓库、Issue 或 Bug 编写专门逻辑。
+对于当前任务，应从 problem statement 和 Workspace 的真实代码中
+推导验证场景，并使用 create_bug_validation / run_bug_validation
+完成“修改前复现 → 修改后验证”的闭环。临时验证文件将在任务结束时清理。
 
 请自主调查并修复这个问题。
 
@@ -763,29 +817,19 @@ def contains_any(text, keywords):
 
 def should_mark_evidence_ready(path):
     """
-    根据当前任务和已读取文件判断是否已经拥有
-    足够进入修改阶段的证据。
-
-    当前专门强化 JSONDecodeError / pickle / MRO 类问题，
-    同时保留通用逻辑。
+    判断是否已经读取到足够的真实源代码证据。
+    不绑定任何具体仓库、Issue、类名、函数名或文件路径。
     """
-
     normalized = path.replace("\\", "/").lower()
 
-    # 当前 requests_6629 类任务
-    if (
-        "jsondecodeerror" in problem_statement.lower()
-        and "pickle" in problem_statement.lower()
-        and "__reduce__" in problem_statement.lower()
-        and "mro" in problem_statement.lower()
-    ):
+    test_like = (
+        normalized.startswith("tests/")
+        or "/tests/" in normalized
+        or normalized.startswith("test_")
+        or normalized.endswith("_test.py")
+    )
 
-        if normalized.endswith(
-            "src/requests/exceptions.py"
-        ):
-            return True
-
-    return False
+    return not test_like
 
 
 # ============================================================
@@ -802,7 +846,8 @@ for round_number in range(MAX_ROUNDS):
     # 如果已经修改 + 测试通过
     # --------------------------------------------------------
 
-    if edited and tests_passed:
+    if (edited and syntax_passed and tests_passed and validation_created
+                and validation_baseline_confirmed and validation_passed):
 
         print("\n========== 修复完成 ==========")
         print(
@@ -855,7 +900,8 @@ for round_number in range(MAX_ROUNDS):
         # 真正完成
         # ----------------------------------------------------
 
-        if edited and tests_passed:
+        if (edited and syntax_passed and tests_passed and validation_created
+                and validation_baseline_confirmed and validation_passed):
 
             print(
                 "\n========== 修复完成 =========="
@@ -880,26 +926,52 @@ for round_number in range(MAX_ROUNDS):
         )
 
         # 根据当前状态给出不同的强制指令
-        if evidence_ready and not edited:
+        if evidence_ready and not edited and not validation_created:
 
             continuation = """
-你已经拥有足够的代码证据。
+你已经获得了足够的真实代码证据。
 
-现在禁止继续 retrieve_code。
+在修改任何源代码之前，必须建立针对当前 Bug 的通用临时回归验证。
 
-必须立即调用：
+现在必须调用：
+create_bug_validation
 
+验证代码必须来自当前 problem statement、真实源代码和实际 Bug 行为，
+不得绑定某个固定仓库、Issue、类名或文件名。
+
+创建成功后立即调用：
+run_bug_validation
+
+修改前验证必须 FAIL，才能确认 baseline。
+在 baseline 未确认前禁止调用 replace_in_file。
+"""
+
+        elif evidence_ready and not edited and validation_created and not validation_baseline_confirmed:
+
+            continuation = """
+临时 Bug 回归验证已经创建，但修改前 baseline 尚未确认。
+
+现在必须调用：
+run_bug_validation
+
+预期结果是 FAIL，表示原始 Bug 可以复现。
+只有确认 baseline 后才能调用 replace_in_file。
+"""
+
+        elif evidence_ready and not edited and validation_created and validation_baseline_confirmed:
+
+            continuation = """
+原始 Bug 已经通过临时回归验证确认可以复现。
+
+现在必须调用：
 replace_in_file
 
-然后：
-
+然后严格执行：
 check_syntax
-↓
-run_test
+→ run_test
+→ run_bug_validation
 
-不要只输出修改方案。
-不要解释你准备怎么修改。
-必须真实调用 replace_in_file。
+不要只描述修改方案，必须真实修改当前 Workspace 中的源代码。
 """
 
         elif edited and not syntax_passed:
@@ -918,6 +990,25 @@ check_syntax
 run_test
 """
 
+        elif validation_failed:
+
+            continuation = """
+通用 Bug 回归验证失败。
+
+这说明当前修改没有真正修复原始 Bug。
+不要只重复运行验证而不分析失败原因。
+
+请根据 Bug 验证返回的真实失败输出重新分析：
+1. 必要时 read_file 阅读真实代码；
+2. 必要时 retrieve_code 定位相关代码；
+3. 调用 replace_in_file 修正真正的缺陷；
+4. check_syntax；
+5. run_test；
+6. 最后再次 run_bug_validation。
+
+禁止修改 tests。
+"""
+
         elif edited and syntax_passed and not tests_passed:
 
             continuation = """
@@ -927,6 +1018,27 @@ run_test
 
 run_test
 
+使用与问题直接相关的测试。
+不要结束任务。
+"""
+
+        elif (
+            edited
+            and syntax_passed
+            and tests_passed
+            and validation_created
+            and not validation_passed
+        ):
+
+            continuation = """
+代码已经修改、语法检查通过、pytest 也通过。
+
+当前 Workspace 存在通用 Bug 回归验证。
+现在必须调用：
+
+run_bug_validation
+
+必须先创建临时验证测试，然后运行 run_bug_validation。
 不要结束任务。
 """
 
@@ -1129,6 +1241,69 @@ retrieve_code 已经连续使用多次，
                     # ========================================
 
                     if (
+                        tool_name == "replace_in_file"
+                        and not validation_created
+                    ):
+                        result = {
+                            "status": "BLOCKED",
+                            "message": "尚未创建临时 Bug 回归验证，不能修改源代码。必须先 create_bug_validation。"
+                        }
+                        print("\n⚠️ Runtime Guard：必须先建立通用 Bug 验证")
+
+                    elif (
+                        tool_name == "replace_in_file"
+                        and not validation_baseline_confirmed
+                    ):
+                        result = {
+                            "status": "BLOCKED",
+                            "message": "原始 Bug 尚未完成修改前 baseline 验证，不能修改源代码。必须先 run_bug_validation 并确认 FAIL。"
+                        }
+                        print("\n⚠️ Runtime Guard：必须先确认 Bug baseline")
+
+                    elif (
+                        tool_name == "create_bug_validation"
+                        and edited
+                        and not validation_baseline_confirmed
+                    ):
+                        result = {
+                            "status": "BLOCKED",
+                            "message": "代码已经修改，不能首次创建回归验证。必须在修改前建立 baseline。"
+                        }
+                        print("\n⚠️ Runtime Guard：必须在修改代码前建立 Bug 验证 baseline")
+
+                    elif (
+                        tool_name == "run_bug_validation"
+                        and not validation_created
+                    ):
+                        result = {
+                            "status": "BLOCKED",
+                            "message": "尚未创建临时 Bug 验证测试，不能运行。"
+                        }
+                        print("\n⚠️ Runtime Guard：必须先 create_bug_validation")
+
+                    elif (
+                        tool_name == "run_bug_validation"
+                        and not edited
+                        and validation_baseline_confirmed
+                    ):
+                        result = {
+                            "status": "BLOCKED",
+                            "message": "原始 Bug 已经完成 baseline 验证，修改代码后才能再次运行。"
+                        }
+                        print("\n⚠️ Runtime Guard：baseline 已确认，必须先修改代码")
+
+                    elif (
+                        tool_name == "run_bug_validation"
+                        and edited
+                        and not syntax_passed
+                    ):
+                        result = {
+                            "status": "BLOCKED",
+                            "message": "代码已经修改，但尚未通过 check_syntax。"
+                        }
+                        print("\n⚠️ Runtime Guard：禁止跳过语法检查")
+
+                    elif (
                         tool_name == "run_test"
                         and edited
                         and not syntax_passed
@@ -1161,6 +1336,58 @@ retrieve_code 已经连续使用多次，
                         "工具执行失败："
                         f"{type(e).__name__}: {e}"
                     )
+
+        # ====================================================
+        # 处理 create_bug_validation
+        # ====================================================
+
+        if tool_name == "create_bug_validation":
+            if isinstance(result, dict) and result.get("status") == "CREATED":
+                validation_created = True
+                validation_baseline_confirmed = False
+                validation_passed = False
+                validation_failed = False
+                print("\n🧪 已创建通用 Bug 回归验证")
+            else:
+                validation_created = False
+                validation_baseline_confirmed = False
+                validation_passed = False
+
+        # ====================================================
+        # 处理 run_bug_validation
+        # ====================================================
+
+        if tool_name == "run_bug_validation":
+            if isinstance(result, dict):
+                status = result.get("status")
+
+                # 修改前失败 = 原始 Bug 成功复现，这是有效证据。
+                if not edited and status == "FAIL":
+                    validation_baseline_confirmed = True
+                    validation_passed = False
+                    validation_failed = False
+                    print("\n✅ 已确认原始 Bug 可以复现")
+
+                elif not edited and status == "PASS":
+                    validation_baseline_confirmed = False
+                    validation_passed = False
+                    validation_failed = True
+                    print("\n⚠️ 回归验证在修改前就通过，无法证明当前问题确实存在")
+
+                elif edited and not syntax_passed:
+                    validation_passed = False
+                    validation_failed = True
+                    print("\n⚠️ 修改后的代码尚未通过语法检查")
+
+                elif edited and status == "PASS":
+                    validation_passed = True
+                    validation_failed = False
+                    print("\n✅ 通用 Bug 回归验证通过")
+
+                else:
+                    validation_passed = False
+                    validation_failed = True
+                    print("\n❌ 通用 Bug 回归验证未通过：" + str(status))
 
         # ====================================================
         # 处理 read_file
@@ -1211,6 +1438,8 @@ retrieve_code 已经连续使用多次，
                 edited = True
                 tests_passed = False
                 syntax_passed = False
+                validation_passed = False
+                validation_failed = False
 
                 last_edited_file = (
                     arguments.get("path")
@@ -1361,29 +1590,52 @@ retrieve_code 已经连续使用多次，
     # 当前轮结束后，根据状态向 Agent 强化下一步
     # ========================================================
 
-    if evidence_ready and not edited:
+    if evidence_ready and not edited and not validation_created:
 
         messages.append(
             {
                 "role": "user",
                 "content": """
-你已经获得了足够的真实代码证据。
+已经获得足够的真实代码证据。
+现在不能修改源代码。
 
-现在进入修改阶段。
-
-禁止继续 retrieve_code。
-
-请立即调用：
-
-replace_in_file
-
-成功后：
-
-check_syntax
+必须先：
+create_bug_validation
 →
-run_test
+run_bug_validation
 
-必须真正修改代码，不要只描述方案。
+修改前验证必须 FAIL，确认原始 Bug 可以复现后，
+才能调用 replace_in_file。
+"""
+            }
+        )
+
+    elif evidence_ready and not edited and validation_created and not validation_baseline_confirmed:
+
+        messages.append(
+            {
+                "role": "user",
+                "content": """
+临时 Bug 验证已经创建，但 baseline 尚未确认。
+现在必须调用 run_bug_validation。
+预期结果为 FAIL。
+确认 baseline 后才能修改源代码。
+"""
+            }
+        )
+
+    elif evidence_ready and not edited and validation_created and validation_baseline_confirmed:
+
+        messages.append(
+            {
+                "role": "user",
+                "content": """
+原始 Bug 已确认可以复现。
+现在必须调用 replace_in_file 修改真实源代码。
+修改后严格执行：
+check_syntax
+→ run_test
+→ run_bug_validation
 """
             }
         )
@@ -1405,6 +1657,30 @@ check_syntax
             }
         )
 
+    elif validation_failed:
+
+        messages.append(
+            {
+                "role": "user",
+                "content": """
+通用 Bug 回归验证失败。
+
+当前修改没有真正修复原始 Bug。
+请根据回归检查的失败输出重新分析，不要重复无脑运行同一个检查。
+
+必要时重新 read_file / retrieve_code，
+然后必须调用 replace_in_file。
+
+修改后重新执行：
+check_syntax
+→ run_test
+→ run_bug_validation
+
+不要修改 tests。
+"""
+            }
+        )
+
     elif edited and syntax_passed and not tests_passed:
 
         messages.append(
@@ -1422,6 +1698,31 @@ run_test
             }
         )
 
+    elif (
+        edited
+        and syntax_passed
+        and tests_passed
+        and validation_created
+        and not validation_passed
+    ):
+
+        messages.append(
+            {
+                "role": "user",
+                "content": """
+代码已经修改、语法检查通过、pytest 已经通过。
+
+当前 Workspace 已经存在通用 Bug 回归验证。
+现在必须再次调用：
+
+run_bug_validation
+
+这次验证的是修改后的真实代码。
+不要结束任务。
+"""
+            }
+        )
+
 
 # ============================================================
 # 最大轮数结束
@@ -1433,7 +1734,8 @@ else:
         "\n========== 达到最大轮数 =========="
     )
 
-    if edited and tests_passed:
+    if (edited and syntax_passed and tests_passed and validation_created
+                and validation_baseline_confirmed and validation_passed):
 
         print(
             "Agent 已实际修改代码，"
@@ -1452,3 +1754,13 @@ else:
         print(
             "Agent 在限定轮数内没有实际修改代码。"
         )
+
+# ============================================================
+# 清理临时 Bug 验证文件
+# ============================================================
+
+cleanup_result = cleanup_bug_validation()
+if cleanup_result.get("removed"):
+    print("\n🧹 已清理临时 Bug 回归验证文件")
+
+
