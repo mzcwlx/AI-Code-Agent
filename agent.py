@@ -1,7 +1,15 @@
 import json
+import os
+import subprocess
 
 from llm_client import chat
-from tools import tools_map, set_workspace, cleanup_bug_validation
+from tools import (
+    tools_map,
+    set_workspace,
+    cleanup_bug_validation,
+    SESSION_FILE_NAME,
+    VALIDATION_DIR_NAME,
+)
 from task_loader import get_task
 from workspace_manager import create_workspace
 
@@ -10,7 +18,7 @@ from workspace_manager import create_workspace
 # Agent 配置
 # ============================================================
 
-MAX_ROUNDS = 15
+MAX_ROUNDS = 30
 
 edited = False
 tests_passed = False
@@ -19,6 +27,8 @@ validation_created = False
 validation_baseline_confirmed = False
 validation_passed = False
 validation_failed = False
+validation_broken = False
+validation_is_probe = False
 
 # 当前修改后的文件
 last_edited_file = None
@@ -26,6 +36,24 @@ last_edited_file = None
 # Code RAG / 代码阅读状态
 retrieve_count = 0
 read_files = set()
+
+# 连续 read_file 次数（调用其他工具即清零）
+consecutive_reads = 0
+
+# 连续工具调用失败次数（成功即清零）
+consecutive_failures = 0
+
+# 连续路径类失败次数（FileNotFoundError / NotADirectoryError）
+consecutive_path_failures = 0
+
+# 已成功执行的工具调用计数（键 = 工具名 + 参数 JSON）
+tool_call_counts = {}
+
+# 已成功执行过的 RAG 查询（规范化后），避免同一语义查询重复检索
+retrieved_queries = set()
+
+# 最近工具动作摘要，只用于给 LLM 一个紧凑的运行时状态，不无限堆积上下文
+recent_actions = []
 
 # 是否已经获得足够证据进入修改阶段
 evidence_ready = False
@@ -57,7 +85,7 @@ tools = [
                         "type": "string",
                         "description": (
                             "Workspace 内的相对文件路径，"
-                            "例如 src/example.py 或 tests/test_example.py"
+                            "例如 example.py 或 tests/test_example.py"
                         )
                     },
                     "start_line": {
@@ -81,48 +109,28 @@ tools = [
     },
 
     # --------------------------------------------------------
-    # replace_in_file
+    # replace_lines（首选编辑工具）
     # --------------------------------------------------------
 
     {
         "type": "function",
         "function": {
-            "name": "replace_in_file",
+            "name": "replace_lines",
             "description": (
-                "对当前 Workspace 中的源代码执行一次精确文本替换。"
-                "old 必须来自刚刚读取的真实文件，并且只能出现一次。"
-                "禁止修改 tests 目录。"
-                "不要重写整个文件，只修改必要的局部代码。"
+                "按 read_file 返回的真实 1-based 行号，替换源文件的连续代码。"
+                "这是首选的代码修改方式，不需要复述 old 文本。"
+                "start_line 和 end_line 均包含在替换范围内。"
+                "禁止修改 tests 或 .agent_validation。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": (
-                            "Workspace 内的相对文件路径"
-                        )
-                    },
-                    "old": {
-                        "type": "string",
-                        "description": (
-                            "需要被替换的原始代码。"
-                            "必须与真实文件中的代码完全一致。"
-                        )
-                    },
-                    "new": {
-                        "type": "string",
-                        "description": (
-                            "替换后的实际代码。"
-                            "只包含必要的局部修改。"
-                        )
-                    }
+                    "path": {"type": "string", "description": "Workspace 内的真实相对路径"},
+                    "start_line": {"type": "integer", "description": "开始行号，1-based，包含该行"},
+                    "end_line": {"type": "integer", "description": "结束行号，1-based，包含该行"},
+                    "new_code": {"type": "string", "description": "替换后的完整代码，仅覆盖指定行范围"}
                 },
-                "required": [
-                    "path",
-                    "old",
-                    "new"
-                ]
+                "required": ["path", "start_line", "end_line", "new_code"]
             }
         }
     },
@@ -317,6 +325,57 @@ workspace = create_workspace(
 
 set_workspace(workspace)
 
+# ============================================================
+# 会话恢复：上次 API 故障退出后，可从断点继续
+# 而不是从第 1 轮重新开始（不浪费已完成的轮数）
+# ============================================================
+
+session_path = os.path.join(workspace, SESSION_FILE_NAME)
+resumed_session = None
+
+if os.path.isfile(session_path):
+
+    try:
+        with open(
+            session_path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+            resumed_session = json.load(f)
+
+        print(
+            f"\n检测到未完成的会话"
+            f"（已完成 {resumed_session['round_index']} 轮）。"
+        )
+
+        answer = input(
+            "从断点继续？"
+            "（回车=继续 / n=重置 Workspace 重新开始）："
+        ).strip().lower()
+
+        if answer in ("n", "no"):
+            resumed_session = None
+
+    except (OSError, ValueError, KeyError) as e:
+        print(f"\n⚠️ 会话文件无法读取，将重新开始：{e}")
+        resumed_session = None
+
+# 用户明确选择重新开始（或会话损坏）：
+# 把 Workspace 恢复到 base 状态，避免带着上次的半成品修改开局
+if os.path.isfile(session_path) and resumed_session is None:
+
+    subprocess.run(
+        ["git", "checkout", "--", "."],
+        cwd=workspace,
+        capture_output=True
+    )
+
+    cleanup_bug_validation()
+
+    os.remove(session_path)
+
+    print("已重置 Workspace（git checkout + 清理验证文件），从第 1 轮重新开始。")
+
 problem_statement = task["problem_statement"]
 
 
@@ -378,7 +437,7 @@ Bug 原因分析
 - list_files
 - retrieve_code
 - read_file
-- replace_in_file
+- replace_lines
 - check_syntax
 - run_test
 - create_bug_validation
@@ -386,11 +445,17 @@ Bug 原因分析
 
 必须通过真实工具完成工作。
 
+所有文件路径必须以 list_files / retrieve_code / read_file 返回的真实路径为准。
+不要假设 src/ 等目录布局，不要凭空猜测路径。
+工具会在路径写错但 Workspace 内存在唯一同名文件时自动修正路径（如 src/rich/_wrap.py → rich/_wrap.py）；
+返回结果中的真实路径必须用于后续所有调用。
+同一目录不要重复调用 list_files，内容不会变化。
+
 禁止：
 
 - 伪造工具调用
 - 在文本中模拟工具执行
-- 声称已经修改代码但没有调用 replace_in_file
+- 声称已经修改代码但没有调用 replace_lines
 - 声称测试通过但没有真实 run_test 结果
 - 根据自己的推理直接宣布任务成功
 
@@ -407,7 +472,7 @@ Bug 原因分析
 2. 调用 create_bug_validation；
 3. 在任何代码修改之前调用 run_bug_validation；
 4. 如果验证测试失败，这是预期的“Bug 已复现”，必须记录为 baseline confirmed；
-5. 然后调用 replace_in_file 修改真实代码；
+5. 然后调用 replace_lines 修改真实代码；
 6. check_syntax → run_test；
 7. 再次调用 run_bug_validation；
 8. 只有第二次 PASS 才能把原始 Bug 视为真正修复。
@@ -424,7 +489,13 @@ Bug 原因分析
 - 对序列化/反序列化问题，优先验证“原操作能够成功完成 + 恢复后的对象类型/关键状态符合问题描述”，不要自行假设异常消息等细节；
 - 对异常修复问题，验证重点应是问题描述中的异常是否仍然发生，而不是自行重新定义异常的语义；
 - 必须使用真实项目代码，而不是模拟一个假的修复结果；
-- 创建验证测试后，在修改前运行它；如果出现与目标 Bug 无关的错误，应先修正验证测试本身，再确认 baseline。
+- 创建验证测试后，在修改前运行它；如果出现与目标 Bug 无关的错误，应先修正验证测试本身，再确认 baseline；
+- 有效的 baseline 失败必须是 AssertionError（断言失败）。如果失败原因是 AttributeError、TypeError、ImportError 等错误，说明验证测试自身调用了不存在的 API 或写错了代码，必须先修正验证测试再确认 baseline；
+- 验证测试只能调用项目中真实存在的 API；不确定 API 是否存在时，先用 read_file 或 retrieve_code 确认；
+- baseline 验证测试必须能区分有 Bug 与无 Bug 的行为：直接断言 problem statement 描述的精确期望行为优于宽松不变量（如仅断言不抛异常——有 Bug 的代码也可能满足后者），后者可能导致 baseline 误通过；baseline 误通过后重复运行没有意义，必须重新 create_bug_validation 写更强的断言（调整触发条件、断言粒度）；
+- 实验优先于阅读：已定位可疑代码但不确定触发条件时，先写最小复现测试试跑，比继续读文件更接近答案；
+- 现有测试通过不代表目标 Bug 不存在：回归测试通常在修复 PR 中才加入。根据 problem statement 描述的场景自己构造触发输入是预期工作，不算凭空断言；
+- 验证测试写错不是失败：创建 → BROKEN_TEST → 修正 → 重新创建 是正常迭代，不要为避免 BROKEN_TEST 而无限阅读代码。
 
 ============================================================
 
@@ -434,7 +505,7 @@ Bug 原因分析
 
 如果没有调用：
 
-replace_in_file
+replace_lines
 
 就不能说：
 
@@ -498,7 +569,7 @@ read_file
 ↓
 分析
 ↓
-replace_in_file
+replace_lines
 
 ============================================================
 五、非常重要：禁止无限重复 retrieve_code
@@ -534,17 +605,18 @@ retrieve_code
 
 修改代码必须使用：
 
-replace_in_file
+replace_lines
 
-参数只有：
+参数：
 
-path
-old
-new
+- path
+- start_line
+- end_line
+- new_code
 
-old 必须来自真实 read_file 结果。
-
-old 必须与真实文件中的内容完全一致。
+start_line / end_line 是 read_file 返回的 1-based 真实行号，
+起止行都包含在替换范围内。
+new_code 是替换后的完整代码，只覆盖指定行范围。
 
 禁止：
 
@@ -560,7 +632,7 @@ old 必须与真实文件中的内容完全一致。
 
 成功修改代码以后：
 
-replace_in_file
+replace_lines
 ↓
 check_syntax
 ↓
@@ -568,13 +640,13 @@ run_test
 
 不能：
 
-replace_in_file
+replace_lines
 ↓
 直接宣布成功
 
 也不能：
 
-replace_in_file
+replace_lines
 ↓
 run_test
 
@@ -656,8 +728,8 @@ run_test
 1. 成功调用 retrieve_code
 2. 使用 read_file 阅读真实代码
 3. 找到明确缺陷原因
-4. 成功调用 replace_in_file
-5. replace_in_file 返回成功
+4. 成功调用 replace_lines
+5. replace_lines 返回成功
 6. 修改后的代码通过 check_syntax
 7. 修改后的代码经过真实 run_test
 8. run_test 返回 PASS
@@ -682,7 +754,7 @@ run_test
 
 直接：
 
-replace_in_file
+replace_lines
 ↓
 check_syntax
 ↓
@@ -774,6 +846,95 @@ messages = [
 
 
 # ============================================================
+# 恢复会话状态（如有）
+# ============================================================
+
+start_round = 0
+
+if resumed_session is not None:
+
+    saved_state = resumed_session["state"]
+
+    for key in (
+        "edited",
+        "tests_passed",
+        "syntax_passed",
+        "validation_created",
+        "validation_baseline_confirmed",
+        "validation_passed",
+        "validation_failed",
+        "validation_broken",
+        "evidence_ready",
+        "retrieve_count",
+        "consecutive_reads",
+        "consecutive_failures",
+        "consecutive_path_failures",
+        "last_edited_file",
+    ):
+        globals()[key] = saved_state[key]
+
+    # 旧版本会话文件没有该字段，默认 False
+    globals()["validation_is_probe"] = saved_state.get(
+        "validation_is_probe",
+        False
+    )
+
+    read_files.clear()
+    read_files.update(saved_state.get("read_files", []))
+
+    tool_call_counts.clear()
+    for entry in saved_state.get("tool_call_counts", []):
+        tool_call_counts[(entry[0], entry[1])] = entry[2]
+
+    retrieved_queries.clear()
+    retrieved_queries.update(saved_state.get("retrieved_queries", []))
+    recent_actions.clear()
+    recent_actions.extend(saved_state.get("recent_actions", [])[-8:])
+
+    messages = resumed_session["messages"]
+    start_round = resumed_session["round_index"]
+
+    # 修复被中断的 tool_calls：
+    # 如果最后一条 assistant 消息带 tool_calls，但其后没有
+    # 对应的 tool 结果消息（进程在工具执行中途被杀死），
+    # 必须补上合成结果，否则下一次 LLM 调用会因
+    # 消息序列不符合 tool calling 协议而直接报错。
+    _dangling = []
+    for _msg in reversed(messages):
+        if _msg.get("role") == "tool":
+            break
+        if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
+            _dangling = _msg["tool_calls"]
+            break
+
+    if _dangling:
+        for _tc in _dangling:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": _tc.get("id") or "",
+                    "content": (
+                        "工具执行被进程中断，结果未知。"
+                        "请重新调用该工具获取真实结果。"
+                    )
+                }
+            )
+        print(
+            f"\n🔧 已为 {len(_dangling)} 个被中断的"
+            "工具调用补齐结果消息"
+        )
+
+    print(
+        f"\n✅ 已恢复会话："
+        f"从第 {start_round + 1} 轮继续"
+        f"（剩余 {MAX_ROUNDS - start_round} 轮）。"
+    )
+
+    if edited:
+        print(f"上次已修改文件：{last_edited_file}")
+
+
+# ============================================================
 # 辅助函数
 # ============================================================
 
@@ -832,15 +993,263 @@ def should_mark_evidence_ready(path):
     return not test_like
 
 
+def repeat_strategy_hint():
+    """
+    完全重复调用被阻止时，根据当前状态给出
+    应该做什么的具体指引（读取全局状态变量）。
+    """
+    if (
+        validation_created
+        and not edited
+        and not validation_baseline_confirmed
+    ):
+        if validation_broken:
+            return (
+                "\n当前验证测试自身有错误（BROKEN_TEST）："
+                "修正测试代码后重新 create_bug_validation，"
+                "必要时 read_file 确认真实 API。"
+            )
+        if validation_failed:
+            return (
+                "\n当前验证测试没有捕捉到 Bug"
+                "（未修改的代码上 PASS）："
+                "写更强的断言"
+                "（直接断言 problem statement 描述的期望行为），"
+                "重新 create_bug_validation。"
+            )
+        return (
+            "\n当前应调用 run_bug_validation 确认 baseline FAIL。"
+        )
+
+    if evidence_ready and not edited and not validation_created:
+        return (
+            "\n当前应调用 create_bug_validation 创建复现测试。"
+        )
+
+    if edited and not syntax_passed:
+        return "\n当前应调用 check_syntax。"
+
+    if edited and syntax_passed and not tests_passed:
+        return (
+            "\n当前应调用 run_test 验证修改，"
+            "或继续 replace_lines 修复剩余问题。"
+        )
+
+    return ""
+
+
+# ============================================================
+# Agent Runtime State / Context
+# ============================================================
+
+def normalize_query(query):
+    """把 RAG 查询规范化，用于识别完全相同/仅空白不同的重复查询。"""
+    return " ".join(str(query or "").lower().split())
+
+
+def current_phase():
+    """
+    根据 Runtime 真状态计算当前阶段。
+
+    LOCALIZE → VALIDATE → REPAIR → TEST → FINAL_VALIDATE → DONE
+
+    所有输入都来自真实工具结果，LLM 文本不能改变阶段。
+    """
+    if (
+        edited
+        and syntax_passed
+        and tests_passed
+        and validation_created
+        and validation_baseline_confirmed
+        and validation_passed
+    ):
+        return "DONE"
+    if (
+        edited
+        and syntax_passed
+        and tests_passed
+        and validation_created
+        and validation_baseline_confirmed
+    ):
+        return "FINAL_VALIDATE"
+    if edited and syntax_passed:
+        return "TEST"
+    if edited:
+        return "REPAIR"
+    if evidence_ready and validation_baseline_confirmed:
+        return "REPAIR"
+    if evidence_ready:
+        return "VALIDATE"
+    return "LOCALIZE"
+
+
+def next_required_action():
+    """把 Runtime 已知状态转换成唯一的优先动作。"""
+    if edited and syntax_passed and tests_passed and validation_passed:
+        return "STOP: 已满足完成条件，不再调用工具。"
+    if edited and syntax_passed and tests_passed and validation_created and not validation_passed:
+        return "run_bug_validation"
+    if edited and syntax_passed and not tests_passed:
+        return "run_test"
+    if edited and not syntax_passed:
+        return "check_syntax"
+    if evidence_ready and validation_baseline_confirmed:
+        return "replace_lines"
+    if evidence_ready and validation_created and not validation_baseline_confirmed:
+        if validation_failed or validation_broken:
+            return "create_bug_validation（重写验证测试）"
+        return "run_bug_validation"
+    if evidence_ready and not validation_created:
+        return "create_bug_validation"
+    return "retrieve_code / read_file（仅在证据不足时）"
+
+
+def allowed_tools_for_phase():
+    """
+    根据 Runtime 真状态给出本轮允许的工具，防止 LLM 跨阶段乱跳。
+
+    越靠后的阶段允许的工具越完整：
+    后期发现新问题时可以回头读代码、重新修改，
+    不会因为进入 FINAL_VALIDATE 而被锁死在单一工具上。
+    早期阶段则严格限制：没有确认 baseline 之前不可能修改源码。
+    """
+    phase = current_phase()
+    mapping = {
+        "LOCALIZE": {"list_files", "retrieve_code", "read_file"},
+        "VALIDATE": {"read_file", "create_bug_validation", "run_bug_validation"},
+        "REPAIR": {"read_file", "replace_lines", "check_syntax"},
+        "TEST": {"read_file", "replace_lines", "check_syntax", "run_test"},
+        "FINAL_VALIDATE": {
+            "read_file", "replace_lines", "check_syntax",
+            "run_test", "run_bug_validation",
+        },
+        "DONE": set(),
+    }
+    return mapping.get(phase, set())
+
+
+def build_state_context():
+    """每次 LLM 调用前动态生成一份短状态，而不是永久塞进 messages 历史。"""
+    recent = recent_actions[-6:]
+    recent_text = "\n".join(
+        f"- {item}" for item in recent
+    ) or "- 暂无"
+
+    read_text = ", ".join(sorted(read_files)[-10:]) or "无"
+    query_text = ", ".join(sorted(retrieved_queries)[-6:]) or "无"
+
+    return f"""
+================ CURRENT AGENT STATE ================
+这是 Runtime 的真实状态，不是用户的新问题，也不是建议。
+你必须优先服从这里的状态，避免重复已经完成的动作。
+
+phase: {current_phase()}
+retrieve_count: {retrieve_count}
+evidence_ready: {evidence_ready}
+validation_created: {validation_created}
+validation_baseline_confirmed: {validation_baseline_confirmed}
+edited: {edited}
+last_edited_file: {last_edited_file or '无'}
+syntax_passed: {syntax_passed}
+tests_passed: {tests_passed}
+validation_failed: {validation_failed}
+validation_broken: {validation_broken}
+validation_passed: {validation_passed}
+
+已读取文件：
+{read_text}
+
+已经成功执行过的 RAG 查询（不要重复这些查询）：
+{query_text}
+
+最近工具动作：
+{recent_text}
+
+当前唯一优先动作：
+{next_required_action()}
+
+当前阶段允许的工具：
+{", ".join(sorted(allowed_tools_for_phase())) or "无"}
+
+规则：
+1. 如果 evidence_ready=True，禁止继续探索式 retrieve_code/list_files，除非已有证据明确不足。
+2. 如果某个 RAG 查询已经执行过，不要再次用同义改写重复检索；应使用已有结果 + read_file。
+3. 如果已找到真实源码，下一步优先是验证或修改，而不是继续收集上下文。
+4. Runtime Guard 阻止某个动作时，不要反复尝试同一个动作；执行 CURRENT AGENT STATE 中的唯一优先动作。
+5. 只有真实工具结果才能改变状态；不要凭文本声称“已完成”。
+=======================================================
+"""
+
+
 # ============================================================
 # Agent Loop
 # ============================================================
 
-for round_number in range(MAX_ROUNDS):
+llm_failed = False
+
+for round_number in range(start_round, MAX_ROUNDS):
 
     print(
         f"\n========= 第 {round_number + 1} 轮 ========="
     )
+
+    # --------------------------------------------------------
+    # 保存会话进度（放在轮首：所有 continue/break 路径都能覆盖，
+    # 保存的是上一轮完全结束后的状态）
+    # --------------------------------------------------------
+
+    try:
+
+        session_state = {
+            "edited": edited,
+            "tests_passed": tests_passed,
+            "syntax_passed": syntax_passed,
+            "validation_created": validation_created,
+            "validation_baseline_confirmed": validation_baseline_confirmed,
+            "validation_passed": validation_passed,
+            "validation_failed": validation_failed,
+            "validation_broken": validation_broken,
+            "validation_is_probe": validation_is_probe,
+            "evidence_ready": evidence_ready,
+            "retrieve_count": retrieve_count,
+            "consecutive_reads": consecutive_reads,
+            "consecutive_failures": consecutive_failures,
+            "consecutive_path_failures": consecutive_path_failures,
+            "last_edited_file": last_edited_file,
+            "read_files": list(read_files),
+            "retrieved_queries": sorted(retrieved_queries),
+            "recent_actions": list(recent_actions[-8:]),
+            "tool_call_counts": [
+                [tool_name, args_json, count]
+                for (tool_name, args_json), count
+                in tool_call_counts.items()
+            ],
+        }
+
+        # round_index = 当前即将执行的轮次（0 基），
+        # 之前的所有轮次均已完成
+        tmp_path = session_path + ".tmp"
+
+        with open(
+            tmp_path,
+            "w",
+            encoding="utf-8"
+        ) as f:
+            json.dump(
+                {
+                    "round_index": round_number,
+                    "state": session_state,
+                    "messages": messages,
+                },
+                f,
+                ensure_ascii=False
+            )
+
+        # 原子替换，避免写一半损坏会话文件
+        os.replace(tmp_path, session_path)
+
+    except OSError as e:
+        print(f"\n⚠️ 会话进度保存失败：{e}")
 
     # --------------------------------------------------------
     # 如果已经修改 + 测试通过
@@ -861,9 +1270,29 @@ for round_number in range(MAX_ROUNDS):
 
     try:
 
+        # 不把 Runtime State 永久追加到 messages，避免上下文越来越长。
+        # 每一轮只生成一份最新状态，并作为额外 system message 提供给 LLM。
+        llm_messages = list(messages)
+        if llm_messages and llm_messages[0].get("role") == "system":
+            llm_messages.insert(1, {
+                "role": "system",
+                "content": build_state_context()
+            })
+        else:
+            llm_messages.insert(0, {
+                "role": "system",
+                "content": build_state_context()
+            })
+
+        allowed_names = allowed_tools_for_phase()
+        active_tools = [
+            tool for tool in tools
+            if tool["function"]["name"] in allowed_names
+        ]
+
         response = chat(
-            messages,
-            tools=tools
+            llm_messages,
+            tools=active_tools
         )
 
     except Exception as e:
@@ -874,6 +1303,15 @@ for round_number in range(MAX_ROUNDS):
         print(
             f"{type(e).__name__}: {e}"
         )
+        print(
+            "\nLLM API 已连续多次失败，进程退出。\n"
+            "会话进度已自动保存："
+            "稍后重新运行 python agent.py，"
+            "在提示时按回车即可从断点继续，"
+            "已完成的轮数不会浪费。"
+        )
+
+        llm_failed = True
         break
 
     assistant_message = response["message"]
@@ -943,7 +1381,7 @@ create_bug_validation
 run_bug_validation
 
 修改前验证必须 FAIL，才能确认 baseline。
-在 baseline 未确认前禁止调用 replace_in_file。
+在 baseline 未确认前禁止调用 replace_lines。
 """
 
         elif evidence_ready and not edited and validation_created and not validation_baseline_confirmed:
@@ -955,7 +1393,7 @@ run_bug_validation
 run_bug_validation
 
 预期结果是 FAIL，表示原始 Bug 可以复现。
-只有确认 baseline 后才能调用 replace_in_file。
+只有确认 baseline 后才能调用 replace_lines。
 """
 
         elif evidence_ready and not edited and validation_created and validation_baseline_confirmed:
@@ -964,7 +1402,7 @@ run_bug_validation
 原始 Bug 已经通过临时回归验证确认可以复现。
 
 现在必须调用：
-replace_in_file
+replace_lines
 
 然后严格执行：
 check_syntax
@@ -993,7 +1431,9 @@ run_test
         elif validation_failed:
 
             continuation = """
-通用 Bug 回归验证失败。
+通用 Bug 回归验证没有通过。
+如果当前仍未修改源代码，必须重新调用 create_bug_validation 重写验证测试；
+不要重复运行同一个无效测试。
 
 这说明当前修改没有真正修复原始 Bug。
 不要只重复运行验证而不分析失败原因。
@@ -1001,7 +1441,7 @@ run_test
 请根据 Bug 验证返回的真实失败输出重新分析：
 1. 必要时 read_file 阅读真实代码；
 2. 必要时 retrieve_code 定位相关代码；
-3. 调用 replace_in_file 修正真正的缺陷；
+3. 调用 replace_lines 修正真正的缺陷；
 4. check_syntax；
 5. run_test；
 6. 最后再次 run_bug_validation。
@@ -1053,7 +1493,7 @@ run_bug_validation
 请使用 read_file 阅读真实代码。
 
 如果已经能够确定 Bug 原因，
-必须调用 replace_in_file。
+必须调用 replace_lines。
 
 修改后：
 
@@ -1110,8 +1550,8 @@ run_test
             messages.append(
                 {
                     "role": "tool",
-                    "content": result,
-                    "tool_name": tool_name
+                    "tool_call_id": call.get("id") or "",
+                    "content": result
                 }
             )
 
@@ -1126,28 +1566,99 @@ run_test
         )
 
         # ====================================================
+        # 连续 read_file 计数：调用其他工具即清零
+        # ====================================================
+
+        if tool_name != "read_file":
+            consecutive_reads = 0
+
+        # ====================================================
+        # Runtime Guard 0
+        # 完全相同的工具调用禁止无限重复
+        # ====================================================
+
+        call_key = (
+            tool_name,
+            json.dumps(
+                arguments,
+                sort_keys=True,
+                ensure_ascii=False
+            )
+        )
+
+        if tool_call_counts.get(call_key, 0) >= 3:
+
+            result = {
+                "status": "BLOCKED",
+                "message": (
+                    f"已阻止：这是第 "
+                    f"{tool_call_counts[call_key] + 1} 次"
+                    f"用完全相同的参数调用 {tool_name}，"
+                    "结果不会发生任何变化。\n"
+                    "必须改变策略，不要重复相同的调用。"
+                    + repeat_strategy_hint()
+                )
+            }
+
+            print(
+                "\n⚠️ Runtime Guard："
+                "已阻止完全重复的工具调用"
+            )
+
+        # ====================================================
         # Runtime Guard 1
         # 防止无限 retrieve_code
         # ====================================================
 
-        if tool_name == "retrieve_code":
+        elif tool_name == "retrieve_code":
 
-            if evidence_ready:
+            query_key = normalize_query(arguments.get("query", ""))
 
-                result = """
+            if query_key and query_key in retrieved_queries:
+
+                result = {
+                    "status": "BLOCKED",
+                    "message": (
+                        "这个 RAG 查询已经成功执行过，禁止重复检索。\n"
+                        "请直接使用已有检索结果，并执行 CURRENT AGENT STATE 中的下一步动作："
+                        f" {next_required_action()}"
+                    )
+                }
+                print("\n⚠️ Runtime Guard：重复 RAG 查询已阻止")
+
+            elif evidence_ready:
+
+                if not validation_created:
+                    next_hint = (
+                        "1. create_bug_validation：根据 problem statement "
+                        "描述的具体场景写最小复现测试\n"
+                        "   （现有测试大概率覆盖不到该 Bug，"
+                        "需要自己构造触发输入）；\n"
+                        "2. run_bug_validation：修改前 baseline 必须 FAIL。"
+                    )
+                elif not validation_baseline_confirmed:
+                    next_hint = (
+                        "1. run_bug_validation：确认修改前 baseline FAIL；\n"
+                        "   若返回 BROKEN_TEST，按提示修正测试后"
+                        "重新 create_bug_validation。"
+                    )
+                else:
+                    next_hint = (
+                        "replace_lines 修改源码"
+                        " → check_syntax → run_test。"
+                    )
+
+                result = f"""
 [RUNTIME BLOCK]
 
-当前 Agent 已经通过 read_file 获得与问题直接相关的真实代码。
+已经通过 read_file / retrieve_code 获得真实代码证据，
+继续检索已被禁止（重复调用仍会被拒绝）。
 
-继续 retrieve_code 已被禁止。
+当前必须：
+{next_hint}
 
-必须进入：
-
-replace_in_file
-→ check_syntax
-→ run_test
-
-不要继续搜索。
+注意：文件路径必须使用工具返回的真实路径，
+不要假设目录布局，以 list_files / read_file 的真实返回为准。
 """
 
                 print(
@@ -1160,18 +1671,15 @@ replace_in_file
                 result = """
 [RUNTIME BLOCK]
 
-retrieve_code 已经连续使用多次，
-但 Agent 尚未进行代码修改。
+retrieve_code 已达上限，
+继续检索已被禁止（重复调用仍会被拒绝）。
 
-继续检索已被禁止。
-
-请根据已有证据：
-
-1. read_file 阅读真实代码
-2. 分析 Bug
-3. 调用 replace_in_file
-4. check_syntax
-5. run_test
+请根据已有检索结果直接行动：
+1. read_file 阅读检索结果中出现的源码文件
+   （必须使用工具返回的真实路径，不要猜目录布局）；
+2. 分析 Bug 根因；
+3. create_bug_validation 写最小复现测试；
+4. run_bug_validation 确认修改前 baseline FAIL。
 """
 
                 print(
@@ -1214,6 +1722,27 @@ retrieve_code 已经连续使用多次，
                     )
                 ):
                     retrieve_count += 1
+                    query_key = normalize_query(arguments.get("query", ""))
+                    if query_key:
+                        retrieved_queries.add(query_key)
+
+                    # 多次成功检索 = 已获得真实代码证据。
+                    # 即使 Agent 一直没成功 read_file，
+                    # 也能激活验证引导机制。
+                    if (
+                        retrieve_count >= 3
+                        and not evidence_ready
+                    ):
+                        evidence_ready = True
+
+                        print(
+                            "\n🔎 已通过多次检索获得关键代码证据"
+                        )
+
+                        print(
+                            "下一步应进入 "
+                            "create_bug_validation"
+                        )
 
         # ====================================================
         # 其他工具
@@ -1221,11 +1750,28 @@ retrieve_code 已经连续使用多次，
 
         else:
 
-            tool = tools_map.get(
-                tool_name
-            )
+            allowed = allowed_tools_for_phase()
 
-            if tool is None:
+            if tool_name not in allowed:
+                result = {
+                    "status": "BLOCKED",
+                    "message": (
+                        f"当前阶段 {current_phase()} 不允许调用 {tool_name}。"
+                        f"当前唯一优先动作：{next_required_action()}。"
+                    )
+                }
+                print(
+                    f"\n⚠️ Runtime Guard：阶段 {current_phase()} 禁止 {tool_name}"
+                )
+                tool = None
+            else:
+                tool = tools_map.get(
+                    tool_name
+                )
+
+            if tool_name not in allowed:
+                pass
+            elif tool is None:
 
                 result = (
                     f"未找到工具：{tool_name}"
@@ -1241,7 +1787,39 @@ retrieve_code 已经连续使用多次，
                     # ========================================
 
                     if (
-                        tool_name == "replace_in_file"
+                        tool_name == "read_file"
+                        and evidence_ready
+                        and not validation_created
+                        and consecutive_reads >= 4
+                    ):
+                        result = {
+                            "status": "BLOCKED",
+                            "message": (
+                                "已经连续读取多个文件，但尚未创建 Bug 回归验证。"
+                                "继续 read_file 已被暂时禁止。\n"
+                                "当前状态：已获得代码证据，但未验证 Bug 是否可复现。\n"
+                                "必须立即：\n"
+                                "1. 根据 problem statement 描述的具体场景"
+                                "（而不是现有测试），用 create_bug_validation "
+                                "写一个最小复现测试；\n"
+                                "2. run_bug_validation 确认 FAIL baseline。\n"
+                                "注意：\n"
+                                "- problem statement 描述的 Bug 通常没有现成测试覆盖，"
+                                "按描述中的场景自己构造触发输入"
+                                "是预期工作；\n"
+                                "- 如果验证测试写错（返回 BROKEN_TEST），"
+                                "根据 traceback 修正后重新 create_bug_validation 即可，"
+                                "那时可以继续 read_file 查 API。"
+                            )
+                        }
+                        print(
+                            "\n⚠️ Runtime Guard："
+                            "连续读取过多文件但仍未创建验证，"
+                            "必须先做实验"
+                        )
+
+                    elif (
+                        tool_name == "replace_lines"
                         and not validation_created
                     ):
                         result = {
@@ -1251,7 +1829,7 @@ retrieve_code 已经连续使用多次，
                         print("\n⚠️ Runtime Guard：必须先建立通用 Bug 验证")
 
                     elif (
-                        tool_name == "replace_in_file"
+                        tool_name == "replace_lines"
                         and not validation_baseline_confirmed
                     ):
                         result = {
@@ -1280,6 +1858,51 @@ retrieve_code 已经连续使用多次，
                             "message": "尚未创建临时 Bug 验证测试，不能运行。"
                         }
                         print("\n⚠️ Runtime Guard：必须先 create_bug_validation")
+
+                    elif (
+                        tool_name == "run_bug_validation"
+                        and not edited
+                        and validation_created
+                        and not validation_baseline_confirmed
+                        and (validation_failed or validation_broken)
+                    ):
+                        if validation_broken:
+                            reason = (
+                                "上一次运行显示验证测试自身有错误"
+                                "（BROKEN_TEST）"
+                            )
+                        else:
+                            reason = (
+                                "上一次运行显示验证测试在未修改的代码上"
+                                "已经 PASS，没有捕捉到目标 Bug"
+                            )
+
+                        result = {
+                            "status": "BLOCKED",
+                            "message": (
+                                f"已阻止重复运行：{reason}。\n"
+                                "重复运行同一个测试文件，"
+                                "结果不会发生任何变化。\n\n"
+                                "必须重新调用 create_bug_validation，"
+                                "创建修正或更强的验证测试：\n"
+                                "1. 直接断言 problem statement 描述的"
+                                "精确期望行为，"
+                                "而不是宽松的不变量"
+                                "（有 Bug 的代码也可能满足宽松断言）；\n"
+                                "2. 按 problem statement 描述的具体场景"
+                                "构造触发输入（边界条件、特定数据形态）；\n"
+                                "3. 想观察真实行为：临时写一个必定失败的断言"
+                                "（assert False, repr(实际结果)），"
+                                "pytest 输出会显示真实值，"
+                                "据此调整触发条件。\n\n"
+                                "修正测试期间可以继续 read_file "
+                                "查看相关 API。"
+                            )
+                        }
+                        print(
+                            "\n⚠️ Runtime Guard："
+                            "已阻止重复运行无效的验证测试"
+                        )
 
                     elif (
                         tool_name == "run_bug_validation"
@@ -1338,6 +1961,35 @@ retrieve_code 已经连续使用多次，
                     )
 
         # ====================================================
+        # 统计真实执行的工具调用（识别完全重复）
+        # ====================================================
+
+        blocked_result = (
+            isinstance(result, dict)
+            and result.get("status") == "BLOCKED"
+        )
+
+        failed_result = (
+            isinstance(result, str)
+            and (
+                result.startswith("工具执行失败")
+                or result.startswith("[RUNTIME BLOCK]")
+            )
+        )
+
+        if blocked_result:
+            # 被拦截的调用不计数，不消耗重试预算
+            pass
+        else:
+            # 成功与失败都计数：
+            # 相同参数的调用无论成败，重复执行结果都不会变化。
+            # 尤其是失败调用（如 PermissionError / 参数错误），
+            # LLM 盲目重试相同调用只会浪费轮次。
+            tool_call_counts[call_key] = (
+                tool_call_counts.get(call_key, 0) + 1
+            )
+
+        # ====================================================
         # 处理 create_bug_validation
         # ====================================================
 
@@ -1347,11 +1999,33 @@ retrieve_code 已经连续使用多次，
                 validation_baseline_confirmed = False
                 validation_passed = False
                 validation_failed = False
+                validation_broken = False
+                validation_is_probe = bool(
+                    result.get("is_probe")
+                )
+                # 新测试文件使 run_bug_validation 重新有意义
+                tool_call_counts.clear()
                 print("\n🧪 已创建通用 Bug 回归验证")
+            elif isinstance(result, dict) and result.get("status") == "BROKEN_TEST":
+                # 预检发现测试无法被 pytest 收集（导入/语法错误）：
+                # 文件已写入但运行必然失败，按 validation_broken 流转
+                validation_created = True
+                validation_baseline_confirmed = False
+                validation_passed = False
+                validation_failed = False
+                validation_broken = True
+                validation_is_probe = False
+                print(
+                    "\n⚠️ 验证测试创建失败：预检发现导入/语法错误"
+                    "（BROKEN_TEST）"
+                )
             else:
                 validation_created = False
                 validation_baseline_confirmed = False
                 validation_passed = False
+                validation_failed = False
+                validation_broken = False
+                validation_is_probe = False
 
         # ====================================================
         # 处理 run_bug_validation
@@ -1362,16 +2036,71 @@ retrieve_code 已经连续使用多次，
                 status = result.get("status")
 
                 # 修改前失败 = 原始 Bug 成功复现，这是有效证据。
-                if not edited and status == "FAIL":
-                    validation_baseline_confirmed = True
+                if not edited and status == "BROKEN_TEST":
+                    validation_baseline_confirmed = False
                     validation_passed = False
                     validation_failed = False
-                    print("\n✅ 已确认原始 Bug 可以复现")
+                    validation_broken = True
+                    print(
+                        "\n❌ 验证测试自身有错误（"
+                        + str(result.get("error_types"))
+                        + "，非 AssertionError），baseline 无效。"
+                        "必须先修正验证测试，再确认 baseline。"
+                    )
+
+                elif not edited and status == "FAIL":
+
+                    if validation_is_probe:
+                        # 探针测试（assert False）的失败是设计使然，
+                        # 只用于展示真实输出，不是有效的 Bug 复现证据
+                        validation_baseline_confirmed = False
+                        validation_passed = False
+                        validation_failed = True
+                        validation_broken = False
+
+                        result["guidance"] = (
+                            "探针测试已完成使命：上方输出中的"
+                            "断言失败信息展示了真实行为"
+                            "（assert False 的消息里带有 repr 值）。\n"
+                            "现在请基于这些真实值，"
+                            "用精确的断言重写验证测试"
+                            "（把 assert False 替换成对期望输出的断言），"
+                            "重新调用 create_bug_validation，"
+                            "然后 run_bug_validation 确认真正的 baseline。"
+                        )
+
+                        print(
+                            "\n🔍 探针测试已输出真实行为，"
+                            "等待重写为真实断言测试"
+                        )
+
+                    else:
+                        validation_baseline_confirmed = True
+                        validation_passed = False
+                        validation_failed = False
+                        validation_broken = False
+                        print("\n✅ 已确认原始 Bug 可以复现")
 
                 elif not edited and status == "PASS":
                     validation_baseline_confirmed = False
                     validation_passed = False
                     validation_failed = True
+
+                    result["guidance"] = (
+                        "验证测试在未修改的代码上就 PASS，"
+                        "说明它没有捕捉到目标 Bug，"
+                        "重复运行同一个测试不会有任何变化。\n"
+                        "必须重新 create_bug_validation 写更强的测试：\n"
+                        "1. 直接断言 problem statement 描述的精确期望行为，"
+                        "而不是宽松的不变量"
+                        "（有 Bug 的代码也可能满足宽松断言）；\n"
+                        "2. 按 problem statement 描述的具体场景"
+                        "构造触发输入（边界条件、特定数据形态）；\n"
+                        "3. 想观察真实行为：临时写必定失败的断言"
+                        "（assert False, repr(实际结果)），"
+                        "pytest 输出会显示真实值，据此调整。"
+                    )
+
                     print("\n⚠️ 回归验证在修改前就通过，无法证明当前问题确实存在")
 
                 elif edited and not syntax_passed:
@@ -1410,30 +2139,61 @@ retrieve_code 已经连续使用多次，
                         path
                     )
 
+                    consecutive_reads += 1
+
                     if should_mark_evidence_ready(
                         path
                     ):
 
                         evidence_ready = True
 
+                        if not validation_created:
+                            next_step = (
+                                "create_bug_validation"
+                            )
+                        elif (
+                            validation_failed
+                            or validation_broken
+                        ):
+                            # 测试太宽松（修改前 PASS）或自身有错误：
+                            # 下一步是重写更强的测试，不是重复运行
+                            next_step = (
+                                "create_bug_validation"
+                                "（重写更强的验证测试）"
+                            )
+                        elif not validation_baseline_confirmed:
+                            next_step = (
+                                "run_bug_validation"
+                            )
+                        else:
+                            next_step = (
+                                "replace_lines"
+                            )
+
                         print(
                             "\n🔎 已获得关键代码证据"
                         )
 
                         print(
-                            "下一步应进入 replace_in_file"
+                            "下一步应进入 "
+                            f"{next_step}"
                         )
 
         # ====================================================
-        # 处理 replace_in_file
+        # 处理代码修改工具
         # ====================================================
 
-        if tool_name == "replace_in_file":
+        if tool_name == "replace_lines":
 
-            if (
+            edit_success = (
+                isinstance(result, dict)
+                and result.get("status") == "SUCCESS"
+            ) or (
                 isinstance(result, str)
                 and "修改成功" in result
-            ):
+            )
+
+            if edit_success:
 
                 edited = True
                 tests_passed = False
@@ -1441,8 +2201,13 @@ retrieve_code 已经连续使用多次，
                 validation_passed = False
                 validation_failed = False
 
+                # 代码已变化，重新运行测试/验证有了新意义
+                tool_call_counts.clear()
+
                 last_edited_file = (
-                    arguments.get("path")
+                    result.get("path")
+                    if isinstance(result, dict)
+                    else arguments.get("path")
                 )
 
                 print(
@@ -1457,7 +2222,7 @@ retrieve_code 已经连续使用多次，
             else:
 
                 print(
-                    "\n❌ replace_in_file "
+                    "\n❌ replace_lines "
                     "没有返回成功结果"
                 )
 
@@ -1473,12 +2238,22 @@ retrieve_code 已经连续使用多次，
                     "status"
                 )
 
-                if status == "PASS":
+                if status == "PASS" and edited:
 
                     syntax_passed = True
 
                     print(
                         "\n✅ 语法检查通过"
+                    )
+
+                elif status == "PASS":
+
+                    # 修改前的语法检查不构成“修改后语法通过”的证据
+                    syntax_passed = False
+
+                    print(
+                        "\n⚠️ 语法检查通过，"
+                        "但代码尚未修改，不作为修改后证据"
                     )
 
                 else:
@@ -1515,6 +2290,20 @@ retrieve_code 已经连续使用多次，
                     if not edited:
 
                         tests_passed = False
+
+                        result["guidance"] = (
+                            "注意：现有测试通过 ≠ 目标 Bug 不存在。\n"
+                            "回归测试通常在修复 PR 中才加入，"
+                            "当前 Workspace 的测试大概率覆盖不到 "
+                            "problem statement 描述的缺陷场景。\n"
+                            "如果这个 Bug 需要特定的触发条件"
+                            "（problem statement 描述的具体场景），"
+                            "现有测试通过是正常的。\n"
+                            "下一步：根据 problem statement 描述的具体场景，"
+                            "用 create_bug_validation 构造最小复现断言，"
+                            "然后 run_bug_validation 确认 FAIL baseline。\n"
+                            "禁止用继续 read_file 回避实验。"
+                        )
 
                         print(
                             "\n⚠️ 测试通过，"
@@ -1569,14 +2358,56 @@ retrieve_code 已经连续使用多次，
                 tests_passed = False
 
         # ====================================================
+        # 连续失败计数：结果以“工具执行失败”开头视为失败
+        # ====================================================
+
+        if (
+            isinstance(result, str)
+            and result.startswith("工具执行失败")
+        ):
+            consecutive_failures += 1
+
+            if (
+                "FileNotFoundError" in result
+                or "NotADirectoryError" in result
+            ):
+                consecutive_path_failures += 1
+            else:
+                consecutive_path_failures = 0
+        else:
+            consecutive_failures = 0
+            consecutive_path_failures = 0
+
+        # ====================================================
         # 把工具结果交给 LLM
         # ====================================================
+
+        # 保留短的动作轨迹，供下一轮 CURRENT AGENT STATE 使用。
+        # dict 结果用 JSON 序列化（LLM 更好读，也和 tool calling 惯例一致）。
+        if isinstance(result, dict):
+            result_text = json.dumps(
+                result,
+                ensure_ascii=False,
+                default=str
+            )
+        else:
+            result_text = str(result)
+        status_text = result.get("status") if isinstance(result, dict) else None
+        action_summary = f"{tool_name}({json.dumps(arguments, ensure_ascii=False, sort_keys=True)})"
+        if status_text:
+            action_summary += f" -> {status_text}"
+        elif result_text.startswith("工具执行失败"):
+            action_summary += " -> ERROR"
+        elif result_text.startswith("[RUNTIME BLOCK]"):
+            action_summary += " -> BLOCKED"
+        recent_actions.append(action_summary[:500])
+        del recent_actions[:-8]
 
         messages.append(
             {
                 "role": "tool",
-                "content": str(result),
-                "tool_name": tool_name
+                "tool_call_id": call.get("id") or "",
+                "content": result_text
             }
         )
 
@@ -1590,7 +2421,27 @@ retrieve_code 已经连续使用多次，
     # 当前轮结束后，根据状态向 Agent 强化下一步
     # ========================================================
 
-    if evidence_ready and not edited and not validation_created:
+    if consecutive_path_failures >= 3 and not edited:
+
+        messages.append(
+            {
+                "role": "user",
+                "content": f"""
+你已经连续 {consecutive_path_failures} 次因为文件路径不存在而失败，
+原因几乎都是凭空猜测路径（如假设特定目录布局）。
+
+请立即停止猜测：
+1. 以 list_files 返回的真实目录结构为准，
+   源码位置因项目而异（可能在根目录，也可能在 src/ 下）；
+2. 错误信息中已经给出真实路径或可用测试目标，
+   直接使用它们，不要换一个新路径再猜；
+3. 上文 retrieve_code 已返回相关源码，
+   可以直接基于它行动。
+"""
+            }
+        )
+
+    elif evidence_ready and not edited and not validation_created:
 
         messages.append(
             {
@@ -1605,24 +2456,70 @@ create_bug_validation
 run_bug_validation
 
 修改前验证必须 FAIL，确认原始 Bug 可以复现后，
-才能调用 replace_in_file。
+才能调用 replace_lines。
+
+注意：problem statement 描述的 Bug 通常没有现成测试覆盖，
+按描述中的场景自己构造输入是预期工作。
+不要用继续 read_file 回避实验。
 """
             }
         )
 
     elif evidence_ready and not edited and validation_created and not validation_baseline_confirmed:
 
-        messages.append(
-            {
-                "role": "user",
-                "content": """
+        if validation_broken:
+
+            messages.append(
+                {
+                    "role": "user",
+                    "content": """
+当前验证测试自身存在错误（BROKEN_TEST），
+调用不存在的 API 或参数错误，无论源代码是否修复都会失败。
+
+必须重新调用 create_bug_validation，
+用真实存在的 API 重写验证测试，
+然后 run_bug_validation 确认 FAIL baseline。
+
+修正测试时可以继续 read_file 查看真实 API 签名。
+"""
+                }
+            )
+
+        elif validation_failed:
+
+            messages.append(
+                {
+                    "role": "user",
+                    "content": """
+当前验证测试没有捕捉到目标 Bug：
+在未修改的代码上运行结果是 PASS。
+重复调用 run_bug_validation 没有意义，会被直接阻止。
+
+必须重新调用 create_bug_validation，写更强的测试：
+1. 直接断言 problem statement 描述的精确期望行为，
+   而不是宽松的不变量（有 Bug 的代码也可能满足宽松断言）；
+2. 按 problem statement 描述的具体场景构造触发输入
+   （边界条件、特定数据形态）；
+3. 想看真实行为：临时写必定失败的断言
+   （assert False, repr(结果)），
+   pytest 输出会显示真实值，据此调整。
+"""
+                }
+            )
+
+        else:
+
+            messages.append(
+                {
+                    "role": "user",
+                    "content": """
 临时 Bug 验证已经创建，但 baseline 尚未确认。
 现在必须调用 run_bug_validation。
 预期结果为 FAIL。
 确认 baseline 后才能修改源代码。
 """
-            }
-        )
+                }
+            )
 
     elif evidence_ready and not edited and validation_created and validation_baseline_confirmed:
 
@@ -1631,7 +2528,7 @@ run_bug_validation
                 "role": "user",
                 "content": """
 原始 Bug 已确认可以复现。
-现在必须调用 replace_in_file 修改真实源代码。
+现在必须调用 replace_lines 修改真实源代码。
 修改后严格执行：
 check_syntax
 → run_test
@@ -1669,7 +2566,7 @@ check_syntax
 请根据回归检查的失败输出重新分析，不要重复无脑运行同一个检查。
 
 必要时重新 read_file / retrieve_code，
-然后必须调用 replace_in_file。
+然后必须调用 replace_lines。
 
 修改后重新执行：
 check_syntax
@@ -1756,11 +2653,20 @@ else:
         )
 
 # ============================================================
-# 清理临时 Bug 验证文件
+# 清理临时 Bug 验证文件与会话文件
+# （修复完成/达到最大轮数 → 清理；
+#   LLM 故障退出 → 全部保留：验证文件是会话状态的一部分，
+#   断点恢复后 run_bug_validation 仍要使用它）
 # ============================================================
 
-cleanup_result = cleanup_bug_validation()
-if cleanup_result.get("removed"):
-    print("\n🧹 已清理临时 Bug 回归验证文件")
+if not llm_failed:
+
+    cleanup_result = cleanup_bug_validation()
+    if cleanup_result.get("removed"):
+        print("\n🧹 已清理临时 Bug 回归验证文件")
+
+    if os.path.isfile(session_path):
+        os.remove(session_path)
+        print("🧹 已清理会话文件")
 
 

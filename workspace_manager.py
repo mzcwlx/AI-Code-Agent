@@ -44,10 +44,11 @@ def prepare_workspace(workspace):
     """
     准备 Workspace 的 Python 虚拟环境和测试依赖。
 
-    当前支持：
-    - 创建 .venv
-    - 如果存在 requirements-dev.txt，则自动安装
+    依赖安装统一由 tools.ensure_test_environment 负责：
+    自动识别 pyproject/setup/requirements，安装项目本体，
+    确保 pytest 存在，成功后写 marker 防止重复安装。
     """
+
     python = get_python_executable(workspace)
 
     # 1. 创建虚拟环境
@@ -68,30 +69,17 @@ def prepare_workspace(workspace):
 
         print(f"虚拟环境创建完成：{python}")
 
-    # 2. 自动安装开发/测试依赖
-    requirements_dev = os.path.join(
-        workspace,
-        "requirements-dev.txt"
-    )
+    # 2. 自动准备依赖环境（失败不阻断，run_test 时会再次尝试）
+    try:
+        import tools
 
-    if os.path.isfile(requirements_dev):
-        print("发现 requirements-dev.txt，正在安装测试依赖...")
+        tools.set_workspace(workspace)
+        result = tools.ensure_test_environment()
 
-        run_command(
-            [
-                python,
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                "requirements-dev.txt"
-            ],
-            cwd=workspace
-        )
-
-        print("测试依赖安装完成。")
-    else:
-        print("未发现 requirements-dev.txt，跳过依赖安装。")
+        print(f"依赖环境：{result.get('status')}")
+        print(result.get("message", ""))
+    except Exception as e:
+        print(f"⚠️ 依赖环境自动准备失败，Agent 运行测试时会再次尝试：{e}")
 
     return python
 

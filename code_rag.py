@@ -318,6 +318,9 @@ def retrieve_code(query, root="."):
 
     注意：这里每次按照当前 query 做候选筛选，
     避免建立整个仓库的超大 embedding 索引。
+
+    Embedding 服务不可用（余额不足 / 网络错误）时，
+    自动降级为纯词法检索，保证 Agent 始终能拿到代码上下文。
     """
     files = collect_python_files(root)
 
@@ -333,30 +336,70 @@ def retrieve_code(query, root="."):
     if not all_chunks:
         return []
 
-    index, indexed_chunks = build_index(all_chunks, query)
+    try:
+        index, indexed_chunks = build_index(all_chunks, query)
 
-    query_embedding = embed_texts([query])[0]
-    query_vector = np.asarray([query_embedding], dtype="float32")
+        query_embedding = embed_texts([query])[0]
+        query_vector = np.asarray([query_embedding], dtype="float32")
 
-    faiss.normalize_L2(query_vector)
+        faiss.normalize_L2(query_vector)
 
-    k = min(5, len(indexed_chunks))
-    scores, indices = index.search(query_vector, k)
+        k = min(5, len(indexed_chunks))
+        scores, indices = index.search(query_vector, k)
 
-    results = []
+        results = []
 
-    for score, idx in zip(scores[0], indices[0]):
-        results.append(
-            {
-                "score": float(score),
-                "file": indexed_chunks[idx]["file"],
-                "type": indexed_chunks[idx]["type"],
-                "name": indexed_chunks[idx]["name"],
-                "code": indexed_chunks[idx]["code"],
-            }
+        for score, idx in zip(scores[0], indices[0]):
+            results.append(
+                {
+                    "score": float(score),
+                    "file": indexed_chunks[idx]["file"],
+                    "type": indexed_chunks[idx]["type"],
+                    "name": indexed_chunks[idx]["name"],
+                    "code": indexed_chunks[idx]["code"],
+                }
+            )
+
+        return results
+
+    except Exception as e:
+        # ------------------------------------------------
+        # Embedding 服务不可用：降级为词法检索。
+        # select_candidates 已按词法相关性降序排序。
+        # ------------------------------------------------
+
+        print(
+            f"⚠️ Embedding 服务不可用（{e}），"
+            "已降级为关键词检索。"
         )
 
-    return results
+        candidates = select_candidates(query, all_chunks)
+
+        results = []
+
+        for chunk in candidates[:5]:
+            score = _lexical_score(query, chunk)
+
+            if score <= 0:
+                continue
+
+            results.append(
+                {
+                    "score": score,
+                    "file": chunk["file"],
+                    "type": chunk["type"],
+                    "name": chunk["name"],
+                    "code": chunk["code"],
+                }
+            )
+
+        if not results:
+            raise RuntimeError(
+                "关键词检索也没有找到相关代码块，"
+                f"请尝试更换查询词。原始错误：{e}"
+            ) from e
+
+        return results
 
 
 def format_results(results):
