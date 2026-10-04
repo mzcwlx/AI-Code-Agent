@@ -256,6 +256,101 @@ def _tests_collectable(python, timeout=180):
     return result.returncode in (0, 5)
 
 
+def _collect_error_packages(python, timeout=180):
+    """
+    收集失败时，从 pytest --collect-only 的错误输出里提取缺失的
+    第三方包名，用于自动补装。
+
+    典型场景：旧代码库不带依赖上界（如 fastapi 只写
+    starlette>=0.46.0），pip install -e . 会装到最新 starlette，
+    而新版 starlette 的 TestClient 依赖新包（如 httpx2），
+    导致全部测试模块导入失败。错误输出会明确给出：
+        RuntimeError: The starlette.testclient module requires
+        the httpx2 package to be installed.
+    以及普通的 ModuleNotFoundError: No module named 'xxx'。
+    第三类是 pytest 配置文件引用了未安装插件报错：
+        ERROR: Unknown config option: timeout
+    选项名经 PYTEST_OPTION_PLUGINS 映射到插件包名
+    （如 timeout -> pytest-timeout）后一并补装。
+
+    返回去重后的包名列表；收集成功则返回空列表。
+    """
+
+    # pytest 配置选项 -> 对应插件包；值为 None 表示忽略
+    PYTEST_OPTION_PLUGINS = {
+        "timeout": "pytest-timeout",
+        "cov": "pytest-cov",
+        "asyncio": "pytest-asyncio",
+        "mock": "pytest-mock",
+        "xdist": "pytest-xdist",
+        "randomly": "pytest-randomly",
+        "rerunfailures": "pytest-rerunfailures",
+        "xprocess": "pytest-xprocess",
+        "metadata": "pytest-metadata",
+        "split_runs": "pytest-split-runs",
+        "basetemp": None,
+    }
+
+    command = [python, "-m", "pytest", "--collect-only", "-q"]
+
+    tests_dir = os.path.join(ACTIVE_WORKSPACE, "tests")
+    if os.path.isdir(tests_dir):
+        command.append("tests")
+
+    try:
+        result = subprocess.run(
+            command,
+            cwd=ACTIVE_WORKSPACE,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return []
+
+    if result.returncode in (0, 5):
+        return []
+
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+
+    names = []
+
+    # RuntimeError: ... requires the httpx2 package to be installed.
+    for match in re.finditer(
+        r"requires the ([A-Za-z0-9_.-]+) package",
+        output
+    ):
+        names.append(match.group(1))
+
+    # ModuleNotFoundError: No module named 'dirty_equals'
+    for match in re.finditer(
+        r"No module named '([A-Za-z0-9_.]+)'",
+        output
+    ):
+        names.append(match.group(1).split(".")[0])
+
+    # ERROR: Unknown config option: timeout（strict-config 下直接退出）
+    for match in re.finditer(
+        r"Unknown config option: ([A-Za-z0-9_]+)",
+        output
+    ):
+        plugin = PYTEST_OPTION_PLUGINS.get(match.group(1))
+        if plugin:
+            names.append(plugin)
+
+    # 去重且保持顺序
+    seen = set()
+    unique = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            unique.append(name)
+
+    return unique
+
+
 def _suggest_similar_paths(missing_path):
     """
     在 Workspace 内查找与缺失路径同名的文件，给出修正建议。
@@ -640,6 +735,57 @@ def ensure_test_environment():
     # 安装完成后再次做真实测试收集。只有 pytest + 项目依赖都能
     # 被导入，才允许写 READY marker；否则不能把“pytest 存在”误判为环境完整。
     if not _tests_collectable(python):
+
+        # ------------------------------------------------
+        # 收集失败 → 解析缺失的第三方包并自动补装。
+        #
+        # 典型场景：fastapi 等项目对传递依赖不设上界
+        # （starlette>=0.46.0），pip 会装到最新 starlette，
+        # 而新版 TestClient 依赖新包（httpx2），
+        # 项目自身的依赖声明里没有它。
+        #
+        # 注意：模块导入在第一个缺失包就会中断，装完一批后
+        # 同一批文件可能暴露出下一批缺失包，因此用有界循环
+        # （最多 5 轮，每个包只尝试安装一次）逐批补装。
+        # ------------------------------------------------
+
+        attempted = set()
+
+        for _ in range(5):
+
+            missing = _collect_error_packages(python)
+
+            new = [name for name in missing if name not in attempted]
+
+            if not new:
+                break
+
+            attempted.update(new)
+
+            code, output = _pip_install_step(
+                python,
+                ["install"] + new,
+                "install_missing_test_deps",
+                install_log,
+                timeout=600
+            )
+
+            if code != 0:
+                break
+
+            if _tests_collectable(python):
+                _write_dependency_marker(python)
+
+                return {
+                    "status": "READY",
+                    "python": python,
+                    "message": (
+                        "检测到测试依赖缺失，已自动补装："
+                        + ", ".join(sorted(attempted))
+                    ),
+                    "install_log": install_log
+                }
+
         return {
             "status": "NOT_READY",
             "python": python,

@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,14 @@ ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TASKS_FILE = ROOT / "tasks.jsonl"
 WORKSPACE_ROOT = ROOT / "workspaces"
+
+# 项目根目录加入 sys.path，复用 workspace_manager 的 workspace 清理逻辑
+sys.path.insert(0, str(ROOT))
+from workspace_manager import (  # noqa: E402
+    WORKSPACE_TTL_HOURS,
+    cleanup_stale_workspaces,
+    touch_workspace,
+)
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 
@@ -189,6 +198,7 @@ def reset_workspace(run):
     ws = run.workspace
     if not (ws and ws.is_dir() and (ws / ".git").exists()):
         return {"reset": False, "message": "workspace 尚未创建，跳过重置"}
+    touch_workspace(str(ws))  # 刷新"最后使用时间"，任务运行期间不会被清理
     git_run(ws, "reset", "--hard", "HEAD")
     git_run(ws, "clean", "-fd", "-e", ".venv", "-e", ".code_agent_deps_ready.json")
     # 断点会话一并清除（clean 通常已移除，这里显式兜底）
@@ -964,6 +974,45 @@ def api_workspace(task_id: str):
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 
+# ============================================================
+# workspace 自动清理（默认保留 WORKSPACE_TTL_HOURS = 24 小时）
+# ============================================================
+
+WORKSPACE_CLEAN_INTERVAL = 3600  # 巡检间隔（秒）
+
+
+def _workspace_cleaner_loop():
+    """后台线程：定期删除超过 TTL 未使用的旧 workspace。"""
+    while True:
+        try:
+            # 运行中任务的 workspace 本轮保留（双保险：
+            # 正常任务在 reset/创建时已刷新过 mtime）
+            protected = {
+                r.workspace.name for r in list(RUNS.values())
+                if r.status == "running"
+            }
+            removed = cleanup_stale_workspaces(
+                workspace_root=str(WORKSPACE_ROOT),
+                protected_ids=protected,
+            )
+            if removed:
+                names = ", ".join(removed[:5])
+                if len(removed) > 5:
+                    names += " 等"
+                print(f"[workspace 清理] 删除 {len(removed)} 个超过 "
+                      f"{WORKSPACE_TTL_HOURS} 小时未使用的旧 workspace：{names}")
+        except Exception as e:
+            print(f"[workspace 清理] 失败（不影响服务）：{e}")
+        time.sleep(WORKSPACE_CLEAN_INTERVAL)
+
+
+def start_workspace_cleaner():
+    threading.Thread(
+        target=_workspace_cleaner_loop, daemon=True, name="ws-cleaner"
+    ).start()
+
+
 if __name__ == "__main__":
+    start_workspace_cleaner()
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)

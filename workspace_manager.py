@@ -1,8 +1,12 @@
 import os
+import shutil
+import stat
 import subprocess
+import time
 
 
 WORKSPACE_ROOT = "workspaces"
+WORKSPACE_TTL_HOURS = 24  # workspace 保留时长（小时），超过后自动删除
 
 
 def run_command(command, cwd=None):
@@ -84,12 +88,77 @@ def prepare_workspace(workspace):
     return python
 
 
+def touch_workspace(workspace):
+    """刷新 workspace 的"最后使用时间"（目录 mtime）。
+
+    每次 prepare/create 前调用一次，正在使用的 workspace
+    就不会超过 TTL，不会被后台清理线程误删。
+    """
+    try:
+        os.utime(workspace)
+    except OSError:
+        pass
+
+
+def _rmtree_force(path):
+    """删除目录树；git 对象文件是只读的，Windows 上需先解锁再删。"""
+
+    def onerror(func, p, _exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+
+    shutil.rmtree(path, onerror=onerror)
+
+
+def cleanup_stale_workspaces(ttl_hours=WORKSPACE_TTL_HOURS,
+                             workspace_root=None,
+                             protected_ids=None):
+    """
+    删除 workspace_root 下保存超过 ttl_hours 的 workspace 目录。
+
+    "最后使用时间"取目录 mtime；
+    create_workspace / reset 时都会刷新 mtime，在用任务不会被误删。
+
+    protected_ids：额外保留的目录名集合（本轮即将使用的 instance_id）。
+    返回被删除的目录名列表。
+    """
+    root = workspace_root or WORKSPACE_ROOT
+    if not os.path.isdir(root):
+        return []
+
+    protected = set(protected_ids or ())
+    ttl_seconds = ttl_hours * 3600
+    now = time.time()
+    deleted = []
+
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path) or name in protected:
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        last_active = st.st_mtime
+        if now - last_active >= ttl_seconds:
+            _rmtree_force(path)
+            deleted.append(name)
+
+    return deleted
+
+
 def create_workspace(repo, base_commit, instance_id):
     os.makedirs(WORKSPACE_ROOT, exist_ok=True)
 
     workspace = os.path.abspath(
         os.path.join(WORKSPACE_ROOT, instance_id)
     )
+
+    # 刷新"最后使用时间"，避免长任务在用期间被后台清理线程误删
+    touch_workspace(workspace)
 
     if os.path.exists(workspace):
         print(f"Workspace 已存在：{workspace}")
