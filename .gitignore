@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 .env
+
+workspaces/
+.agent_validation/
+.agent_session.json
