@@ -16,6 +16,8 @@ const TOOL_ICONS = {
 let currentTask = null;
 let es = null;
 let rawLogLines = [];
+let lastToolRow = null;
+let presetTasks = [];
 
 function esc(s) {
   const d = document.createElement("div");
@@ -39,7 +41,67 @@ function shortArgs(argsStr) {
   }
 }
 
-/* ---------------- 阶段 chips ---------------- */
+function statusText(s) {
+  return { running: "运行中", done: "已完成", failed: "已结束" }[s] || s || "";
+}
+
+/* ---------------- 结构化日志 ---------------- */
+
+function logLine(ev) {
+  const ts = ev.ts || "--:--:--";
+  switch (ev.type) {
+    case "round": return `[${ts}] ────── 第 ${ev.n} 轮 ──────`;
+    case "agent_text":
+      return ev.text.split("\n").map((l) => `[${ts}] AGENT │ ${l}`).join("\n");
+    case "tool": return `[${ts}] TOOL  ${ev.name} ${ev.args || ""}`;
+    case "tool_result": {
+      const first = (ev.summary || "").split("\n")[0] || "";
+      return `[${ts}] ←     ${ev.name}（${ev.lines} 行） ${first.slice(0, 160)}`;
+    }
+    case "rag": return `[${ts}] RAG   检索完成（${(ev.content || "").length} 字符）`;
+    case "log": return `[${ts}] SYS   ${ev.line}`;
+    case "status": return `[${ts}] STATE 阶段 → ${ev.phase}`;
+    case "test_counts":
+      return `[${ts}] TEST  ${ev.source}: ${ev.passed} passed / ${ev.failed} failed`;
+    case "edited_file": return `[${ts}] EDIT  ${ev.file}`;
+    case "resume":
+      return `[${ts}] RESUME 断点恢复：已保留 ${ev.from_round} 轮进度，从第 ${ev.from_round + 1} 轮继续`;
+    case "done":
+      return `[${ts}] DONE  ${ev.success ? "修复成功" : "修复未完成"}`;
+    default: return null;
+  }
+}
+
+function appendLog(ev) {
+  const line = logLine(ev);
+  if (line === null) return;
+  rawLogLines.push(line);
+  const box = $("rawLog");
+  box.textContent = rawLogLines.join("\n");
+  box.scrollTop = box.scrollHeight;
+}
+
+function downloadLog() {
+  if (!currentTask || !rawLogLines.length) return;
+  const header = [
+    "CodeDoctor 运行日志",
+    `任务: ${currentTask.task_id}`,
+    `仓库: ${currentTask.repo || "-"}`,
+    `导出时间: ${new Date().toLocaleString()}`,
+    "────────────────────────────────────────",
+    "",
+  ].join("\n");
+  const blob = new Blob(["\ufeff" + header + rawLogLines.join("\n")], {
+    type: "text/plain;charset=utf-8",
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${currentTask.task_id}.log`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ---------------- 阶段 chips / 状态位 ---------------- */
 
 function renderPhases(current) {
   const box = $("phases");
@@ -53,6 +115,23 @@ function renderPhases(current) {
   });
 }
 
+function applyFlags(flags, phase) {
+  renderPhases(phase);
+  if (!flags) return;
+  if (flags.baseline_confirmed) {
+    $("baseline").textContent = "FAIL";
+    $("baseline").style.color = "var(--yellow)";
+  }
+  if (flags.validation_passed) {
+    $("validation").textContent = "PASS";
+    $("validation").style.color = "var(--green)";
+  }
+  if (flags.tests_passed) {
+    $("testStatus").textContent = "TESTS PASS";
+    $("testStatus").style.color = "var(--green)";
+  }
+}
+
 /* ---------------- 任务准备 ---------------- */
 
 function activeTab() {
@@ -61,8 +140,9 @@ function activeTab() {
 
 function setTask(task) {
   currentTask = task;
+  localStorage.setItem("codedoctor_task", task.task_id);
   $("taskId").textContent = task.task_id;
-  $("heroTitle").textContent = task.title || task.problem.slice(0, 110);
+  $("heroTitle").textContent = task.title || (task.problem || "").slice(0, 110);
   $("heroSub").textContent =
     `任务 ${task.task_id} · 来源 ${task.source}` +
     (task.filename ? ` · ${task.filename}` : "");
@@ -144,8 +224,6 @@ async function prepareTask() {
   }
 }
 
-let presetTasks = [];
-
 async function loadPresets() {
   try {
     const res = await fetch("/api/tasks");
@@ -160,7 +238,10 @@ async function loadPresets() {
     presetTasks.forEach((t) => {
       const o = document.createElement("option");
       o.value = t.instance_id;
-      o.textContent = `${t.instance_id}（${t.repo}）`;
+      const badge = t.status
+        ? { running: " · 运行中", done: " · 已完成", failed: " · 已结束" }[t.status] || ""
+        : "";
+      o.textContent = `${t.instance_id}（${t.repo}）${badge}`;
       sel.appendChild(o);
     });
   } catch (e) { /* 忽略 */ }
@@ -178,7 +259,9 @@ function resetRunUI() {
   $("passed").textContent = "0";
   $("failed").textContent = "0";
   $("validation").textContent = "—";
+  $("validation").style.color = "";
   $("baseline").textContent = "—";
+  $("baseline").style.color = "";
   $("testStatus").textContent = "RUNNING";
   $("testStatus").className = "";
   $("testStatus").style.color = "var(--yellow)";
@@ -186,6 +269,7 @@ function resetRunUI() {
   $("downloadBtn").hidden = true;
   rawLogLines = [];
   $("rawLog").textContent = "";
+  lastToolRow = null;
   renderPhases("LOCALIZE");
 }
 
@@ -193,12 +277,6 @@ function setTopStatus(mode, text) {
   const el = $("agentStatus");
   el.className = "status" + (mode === "warn" ? " warn" : mode === "err" ? " err" : "");
   $("statusText").textContent = text;
-}
-
-function appendRaw(line) {
-  rawLogLines.push(line);
-  if (rawLogLines.length > 400) rawLogLines.splice(0, rawLogLines.length - 400);
-  $("rawLog").textContent = rawLogLines.join("\n");
 }
 
 function addStep(icon, message, argsStr, ok) {
@@ -211,6 +289,7 @@ function addStep(icon, message, argsStr, ok) {
     }</div>`;
   wf.appendChild(row);
   wf.scrollTop = wf.scrollHeight;
+  return row;
 }
 
 function addRoundDivider(n) {
@@ -227,6 +306,18 @@ function addAgentNote(text) {
   note.className = "agent-note";
   note.textContent = text;
   wf.appendChild(note);
+  wf.scrollTop = wf.scrollHeight;
+}
+
+function attachToolResult(ev) {
+  if (!lastToolRow) return;
+  const first = (ev.summary || "").split("\n")[0] || "";
+  if (!first) return;
+  const div = document.createElement("div");
+  div.className = "result";
+  div.textContent = `↳ ${first.slice(0, 140)}${first.length > 140 ? "…" : ""}`;
+  lastToolRow.lastElementChild.appendChild(div);
+  const wf = $("workflow");
   wf.scrollTop = wf.scrollHeight;
 }
 
@@ -254,6 +345,9 @@ function renderDiff(diffText, fileLabel) {
 
 function showResult(ev) {
   const r = ev.result || {};
+  const shouldResume = !!(r.llm_failed || r.stopped);
+  if (currentTask) currentTask.shouldResume = shouldResume;
+
   const card = $("resultCard");
   card.hidden = false;
 
@@ -287,35 +381,46 @@ function showResult(ev) {
     .map(([k, v]) => `<li>${esc(k)}：${v ? "PASS" : "—"}</li>`)
     .join("");
 
+  const notes = [];
+  const resumeFrom = (r.resume_round != null ? r.resume_round : (r.round || 0)) + 1;
+  if (r.stopped) {
+    notes.push(`<li style="color:var(--yellow)">已手动终止 — 点击「从断点继续」将从第 ${resumeFrom} 轮恢复，不丢进度</li>`);
+  } else if (r.llm_failed) {
+    notes.push(`<li style="color:var(--yellow)">LLM 调用失败中断 — 点击「从断点继续」将从第 ${resumeFrom} 轮恢复，不丢进度</li>`);
+  } else if (r.max_rounds && !ev.success) {
+    notes.push('<li style="color:var(--red)">达到最大轮数仍未完成修复，重跑将从干净状态重新开始</li>');
+  }
+
   const files = (r.changed_files || []).map((f) => esc(f)).join("、") || "无";
   $("resultText").innerHTML = `
     <ul>
       <li>修改文件：${files}</li>
       ${flagList}
-      ${r.llm_failed ? '<li style="color:var(--red)">LLM 调用失败中断（可直接重试，从断点继续）</li>' : ""}
-      ${r.max_rounds && !ev.success ? '<li style="color:var(--red)">达到最大轮数仍未完成修复</li>' : ""}
+      ${notes.join("")}
     </ul>`;
 
   renderDiff(r.diff, (r.changed_files || []).join(", "));
+
+  $("startBtn").disabled = false;
+  $("startBtn").textContent = shouldResume ? "↻ 从断点继续" : "↻ Run Again";
+  $("stopBtn").hidden = true;
 }
 
 function handleEvent(ev) {
+  appendLog(ev);
   switch (ev.type) {
     case "round":
       $("round").textContent = `ROUND ${ev.n}`;
       addRoundDivider(ev.n);
-      appendRaw(`========= 第 ${ev.n} 轮 =========`);
       break;
     case "agent_text":
       addAgentNote(ev.text);
-      appendRaw(ev.text);
       break;
     case "tool":
-      addStep(TOOL_ICONS[ev.name] || "·", ev.name, ev.args, false);
-      appendRaw(`调用工具：${ev.name} ${ev.args || ""}`);
+      lastToolRow = addStep(TOOL_ICONS[ev.name] || "·", ev.name, ev.args, false);
       break;
-    case "log":
-      appendRaw(ev.line);
+    case "tool_result":
+      attachToolResult(ev);
       break;
     case "rag":
       $("ragCode").textContent = ev.content;
@@ -334,28 +439,18 @@ function handleEvent(ev) {
         $("validation").style.color = ev.failed > 0 ? "var(--red)" : "var(--green)";
       }
       break;
-    case "status": {
-      renderPhases(ev.phase);
-      const f = ev.flags;
-      if (f.baseline_confirmed) {
-        $("baseline").textContent = "FAIL";
-        $("baseline").style.color = "var(--yellow)";
-      }
-      if (f.validation_passed) {
-        $("validation").textContent = "PASS";
-        $("validation").style.color = "var(--green)";
-      }
-      if (f.tests_passed) {
-        $("testStatus").textContent = "TESTS PASS";
-        $("testStatus").style.color = "var(--green)";
-      }
+    case "status":
+      applyFlags(ev.flags, ev.phase);
       break;
-    }
+    case "resume":
+      addAgentNote(
+        `↩ 断点恢复：上次已完成 ${ev.from_round} 轮，本次从第 ${ev.from_round + 1} 轮继续（进度不丢失）`
+      );
+      applyFlags(ev.flags, ev.phase);
+      break;
     case "done":
       showResult(ev);
       if (es) { es.close(); es = null; }
-      $("startBtn").disabled = false;
-      $("startBtn").textContent = "↻ Run Again";
       break;
   }
 }
@@ -379,43 +474,32 @@ function openStream(taskId) {
 async function startRepair() {
   if (!currentTask) return;
   const tid = currentTask.task_id;
-  const resetAllowed = currentTask.source !== "upload";
-  let reset = resetAllowed && activeTab() === "preset" && $("resetCheck").checked;
+  // 断点续跑（LLM 失败 / 手动终止）绝不重置；
+  // 其余情况由服务端按会话文件自动决定（有会话→续跑，无会话→干净开局）
+  const resumeMode = currentTask.shouldResume === true;
+  const reset = !resumeMode && activeTab() === "preset" && $("resetCheck").checked;
 
   $("startBtn").disabled = true;
   $("startBtn").textContent = "● Agent Running";
+  $("stopBtn").hidden = false;
   setTopStatus("warn", "AGENT RUNNING");
   resetRunUI();
 
   try {
-    let res = await fetch("/api/repair", {
+    const res = await fetch("/api/repair", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ task_id: tid, reset }),
     });
-
-    // 已完成的任务：非上传任务自动带 reset 重试一次
-    if (res.status === 409 && resetAllowed && !reset) {
-      const d = await res.json();
-      if ((d.detail || "").includes("已完成")) {
-        reset = true;
-        res = await fetch("/api/repair", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ task_id: tid, reset: true }),
-        });
-      }
-    }
-
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       $("heroSub").textContent = data.detail || "启动失败";
       setTopStatus("err", "AGENT ERROR");
       $("startBtn").disabled = false;
       $("startBtn").textContent = "▶ Start Repair";
+      $("stopBtn").hidden = true;
       return;
     }
-
     await refreshTree(tid);
     openStream(tid);
   } catch (err) {
@@ -423,7 +507,67 @@ async function startRepair() {
     setTopStatus("err", "AGENT ERROR");
     $("startBtn").disabled = false;
     $("startBtn").textContent = "▶ Start Repair";
+    $("stopBtn").hidden = true;
   }
+}
+
+async function stopRepair() {
+  if (!currentTask) return;
+  if (!window.confirm("确定终止当前 Agent 运行？已完成的轮数会保留，之后可从断点继续。")) return;
+  try {
+    await fetch("/api/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: currentTask.task_id }),
+    });
+  } catch (e) { /* 忽略 */ }
+}
+
+/* ---------------- 刷新 / 重开后恢复现场 ---------------- */
+
+async function restoreSession() {
+  let tasks = [];
+  try {
+    const res = await fetch("/api/active");
+    if (res.ok) tasks = (await res.json()).tasks || [];
+  } catch (e) { return; }
+  if (!tasks.length) return;
+
+  // 优先恢复本设备（localStorage）上次的任务，其次是正在运行的任务
+  const saved = localStorage.getItem("codedoctor_task");
+  let t = tasks.find((x) => x.task_id === saved);
+  if (!t) t = tasks.find((x) => x.status === "running");
+  if (!t) return;
+
+  currentTask = {
+    task_id: t.task_id,
+    source: t.source,
+    problem: t.problem || "",
+    title: t.label || t.repo || t.task_id,
+    filename: t.label,
+    repo: t.repo,
+    shouldResume: !!(t.result && (t.result.llm_failed || t.result.stopped)),
+  };
+  localStorage.setItem("codedoctor_task", t.task_id);
+  $("taskId").textContent = t.task_id;
+  $("heroTitle").textContent = t.label || t.repo || t.task_id;
+  $("heroSub").textContent = `任务 ${t.task_id} · 来源 ${t.source} · ${statusText(t.status)}`;
+  $("wsProject").textContent = t.repo || t.label || t.task_id;
+  $("startBtn").disabled = false;
+
+  await refreshTree(t.task_id);
+  resetRunUI();
+
+  if (t.status === "running") {
+    $("startBtn").disabled = true;
+    $("startBtn").textContent = "● Agent Running";
+    $("stopBtn").hidden = false;
+    setTopStatus("warn", "AGENT RUNNING");
+  } else {
+    $("startBtn").textContent = currentTask.shouldResume ? "↻ 从断点继续" : "↻ Run Again";
+  }
+  // SSE 回放：完整重建历史（轮次 / 工具 / 状态位 / 结果）
+  openStream(t.task_id);
 }
 
 /* ---------------- 初始化 ---------------- */
@@ -458,6 +602,12 @@ function showFile(f) {
 
 $("prepareBtn").addEventListener("click", prepareTask);
 $("startBtn").addEventListener("click", startRepair);
+$("stopBtn").addEventListener("click", stopRepair);
+$("dlLogBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  downloadLog();
+});
 
 renderPhases("LOCALIZE");
 loadPresets();
+restoreSession();

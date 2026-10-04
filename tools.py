@@ -47,7 +47,7 @@ _listed_dirs = {}
 def set_workspace(workspace):
     global ACTIVE_WORKSPACE
     global RAG_INDEX, RAG_CHUNKS, RAG_WORKSPACE, RAG_QUERY_CACHE
-    global _listed_dirs
+    global _listed_dirs, _read_ranges
 
     ACTIVE_WORKSPACE = os.path.abspath(workspace)
 
@@ -61,6 +61,9 @@ def set_workspace(workspace):
     RAG_WORKSPACE = None
     RAG_QUERY_CACHE.clear()
     _listed_dirs = {}
+    # 每次 Agent Run / 会话恢复都重新开始：
+    # 恢复后最近上下文可能已被裁剪，必须允许重新读取
+    _read_ranges = {}
 
 
 def get_workspace_path(path):
@@ -683,11 +686,12 @@ def read_file(path, start_line=1, max_lines=200):
     if range_key in _read_ranges:
         total = _read_ranges[range_key]
         return (
-            f"文件 {real_path} 第 {start_line}-"
+            f"[READ-BLOCKED] 文件 {real_path} 第 {start_line}-"
             f"{min(start_line + max_lines - 1, total)} 行"
-            "已在本会话中读取过，内容没有任何变化。\n"
-            "如需查看其他范围，请指定不同的 start_line / max_lines；"
-            "如已读过全文件，请直接基于已读内容继续工作。"
+            "已在本会话中读取过，且文件未发生变化，本次读取被拦截。\n"
+            "如果当前上下文中仍然看得到该内容，请直接基于已读内容继续工作；\n"
+            "如果上下文中已看不到（早期内容可能被裁剪），"
+            "请改用更小的 max_lines 分段重新读取——不同参数不会被拦截。"
         )
 
     if start_line < 1:

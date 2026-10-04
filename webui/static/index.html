@@ -77,8 +77,8 @@
             <label class="field-label">选择任务</label>
             <select id="presetSelect"></select>
             <label class="check-row">
-              <input type="checkbox" id="resetCheck" checked>
-              从干净的初始状态开始（git reset，保留虚拟环境）
+              <input type="checkbox" id="resetCheck">
+              强制从第 1 轮重新开始（忽略断点，重置 Workspace）
             </label>
           </div>
 
@@ -93,7 +93,10 @@
           <h1 id="heroTitle">创建或选择一个任务开始修复</h1>
           <p id="heroSub">Agent 自主分析、检索、修改并验证项目。</p>
         </div>
-        <button id="startBtn" disabled>▶ Start Repair</button>
+        <div class="hero-actions">
+          <button id="startBtn" disabled>▶ Start Repair</button>
+          <button id="stopBtn" class="stop-btn" hidden type="button">■ 终止运行</button>
+        </div>
       </div>
 
       <div class="grid">
@@ -107,12 +110,15 @@
             <div class="empty">Waiting for agent...</div>
           </div>
           <details class="rawlog">
-            <summary>完整运行日志</summary>
+            <summary>
+              <span>完整运行日志</span>
+              <button id="dlLogBtn" class="link-btn" type="button">⬇ 保存日志</button>
+            </summary>
             <pre id="rawLog"></pre>
           </details>
         </section>
 
-        <section class="card">
+        <section class="card fill">
           <div class="card-head"><span>RETRIEVED CODE</span><span id="ragCount">—</span></div>
           <div class="code-box"><pre id="ragCode">尚无检索结果</pre></div>
         </section>

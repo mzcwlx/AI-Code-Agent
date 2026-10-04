@@ -20,6 +20,104 @@ from workspace_manager import create_workspace
 
 MAX_ROUNDS = 30
 
+# ---- 上下文控制（只影响发给 LLM 的消息，不影响工具真实执行结果）----
+MAX_TOOL_RESULT_CHARS = 8000   # 单条工具结果进 LLM 上下文的上限
+MAX_RECENT_MESSAGES = 8        # 发给 LLM 的最近消息条数下限（按完整轮块保留）
+MAX_RECENT_CONTEXT_CHARS = 48000  # 最近上下文总字符上限（超出时从最旧的块开始丢弃）
+TASK_SUMMARY_CHARS = 1200      # 任务摘要（problem statement）保留长度
+
+
+def truncate_tool_result(text, limit=MAX_TOOL_RESULT_CHARS):
+    """限制工具结果进入 LLM 上下文的长度。
+
+    只在 result_text 追加进 messages 前调用；
+    工具的真实执行结果（stdout 打印 / 返回值）不受影响。
+    头尾保留：文件路径与代码开头在头部，traceback / 测试统计在尾部。
+    """
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    head = int(limit * 0.7)
+    tail = int(limit * 0.25)
+    omitted = len(text) - head - tail
+    return (
+        text[:head]
+        + f"\n...[工具输出已截断，省略中间 {omitted} 字符（完整输出共 {len(text)} 字符）]...\n"
+        + text[-tail:]
+    )
+
+
+def build_llm_context(messages, problem_statement, workspace):
+    """构造每轮发给 LLM 的压缩上下文视图。
+
+    messages（完整历史账本）保持不动，用于会话保存与断点恢复；
+    这里只生成当轮请求的视图：
+
+        system prompt
+        + 当前 Agent State（build_state_context）
+        + Task Summary（历史被裁剪时补位）
+        + 最近若干完整轮块（assistant + 其 tool 结果成对保留）
+
+    轮块 = 一条 assistant 消息 + 紧随其后的所有 tool 结果。
+    以块为单位裁剪，保证 tool_call 与 tool_call_id 配对永远完整。
+    """
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    body = [m for m in messages if m.get("role") != "system"]
+
+    # 按轮分块：assistant 开新块，其余消息归入当前块
+    blocks = []
+    for m in body:
+        if m.get("role") == "assistant" or not blocks:
+            blocks.append([m])
+        else:
+            blocks[-1].append(m)
+
+    # 从最近的块往前收集，直到条数达标；块不可分割
+    recent = []
+    count = 0
+    for block in reversed(blocks):
+        recent.insert(0, block)
+        count += len(block)
+        if count >= MAX_RECENT_MESSAGES:
+            break
+
+    # 字符预算：从最旧的块开始丢弃
+    def block_chars(block):
+        return sum(len(str(m.get("content") or "")) for m in block)
+
+    while len(recent) > 1 and sum(block_chars(b) for b in recent) > MAX_RECENT_CONTEXT_CHARS:
+        recent.pop(0)
+
+    kept = [m for b in recent for m in b]
+    dropped_rounds = len(blocks) - len(recent)
+    # 初始任务陈述（body 首条 user）是否已被裁掉
+    task_still_visible = body and body[0] in kept
+
+    llm_messages = []
+    if system_msgs:
+        llm_messages.append(system_msgs[0])
+    llm_messages.append({
+        "role": "system",
+        "content": build_state_context(),
+    })
+
+    if dropped_rounds > 0 or not task_still_visible:
+        summary = (problem_statement or "").strip()
+        if len(summary) > TASK_SUMMARY_CHARS:
+            summary = summary[:TASK_SUMMARY_CHARS] + f"\n...[问题描述已截断，完整长度 {len(problem_statement)} 字符]"
+        notice = (
+            "[Context Notice] 为控制上下文长度，更早的 "
+            f"{max(dropped_rounds, 0)} 轮对话已省略。\n"
+            "关键事实见当前状态；如需查看已省略的代码，"
+            "请用不同参数重新 read_file（相同参数会被去重拦截）。\n\n"
+            f"[Task Summary]\n{summary}\n\n"
+            f"[Workspace]\n{workspace}"
+        )
+        llm_messages.append({"role": "user", "content": notice})
+
+    llm_messages.extend(kept)
+    return llm_messages
+
+
 edited = False
 tests_passed = False
 syntax_passed = False
@@ -1270,19 +1368,12 @@ for round_number in range(start_round, MAX_ROUNDS):
 
     try:
 
-        # 不把 Runtime State 永久追加到 messages，避免上下文越来越长。
-        # 每一轮只生成一份最新状态，并作为额外 system message 提供给 LLM。
-        llm_messages = list(messages)
-        if llm_messages and llm_messages[0].get("role") == "system":
-            llm_messages.insert(1, {
-                "role": "system",
-                "content": build_state_context()
-            })
-        else:
-            llm_messages.insert(0, {
-                "role": "system",
-                "content": build_state_context()
-            })
+        # 上下文裁剪：messages 完整历史不动（供会话保存/恢复），
+        # 每轮只把 system + 当前状态 + 任务摘要 + 最近完整轮块发给 LLM，
+        # 从根本上控制多轮运行的 context growth。
+        llm_messages = build_llm_context(
+            messages, problem_statement, workspace
+        )
 
         allowed_names = allowed_tools_for_phase()
         active_tools = [
@@ -2402,6 +2493,10 @@ retrieve_code 已达上限，
             action_summary += " -> BLOCKED"
         recent_actions.append(action_summary[:500])
         del recent_actions[:-8]
+
+        # 只截断进入 LLM 上下文的内容；
+        # 上方 print(result)（stdout / Web UI 解析）仍是完整结果
+        result_text = truncate_tool_result(result_text)
 
         messages.append(
             {

@@ -42,6 +42,7 @@ EXCLUDE_DIRS = {
     ".agent_validation", ".mypy_cache", ".ruff_cache", ".eggs",
 }
 EXCLUDE_FILE_PREFIXES = (".agent_session",)
+SESSION_FILE_NAME = ".agent_session.json"
 
 # ---------- agent.py stdout 标记（与已验收的 Runtime 输出严格对应） ----------
 ROUND_RE = re.compile(r"^=+\s*第\s*(\d+)\s*轮\s*=+$")
@@ -85,13 +86,16 @@ def phase_of(flags):
 # ============================================================
 
 class RunState:
-    def __init__(self, task_id, source, workspace, problem, repo=None):
+    def __init__(self, task_id, source, workspace, problem, repo=None, label=None):
         self.task_id = task_id
         self.source = source            # upload | issue | preset
         self.workspace = workspace      # Path（issue 任务在首次运行前可能不存在）
         self.problem = problem
         self.repo = repo
+        self.label = label or repo or task_id
         self.status = "created"         # created | running | done | failed
+        self.created = datetime.now()
+        self.stopped = False
         self.events = []                # SSE 事件回放缓冲
         self.subscribers = []           # [(event_loop, asyncio.Queue)]
         self.proc = None
@@ -116,6 +120,8 @@ class RunState:
                 "task_id": self.task_id,
                 "source": self.source,
                 "repo": self.repo,
+                "label": self.label,
+                "problem": self.problem[:200],
                 "status": self.status,
                 "round": self.round,
                 "flags": dict(self.flags),
@@ -129,6 +135,7 @@ RUNS = {}
 
 
 def emit(run, event):
+    event.setdefault("ts", datetime.now().strftime("%H:%M:%S"))
     with run.lock:
         run.events.append(event)
         for loop, q in list(run.subscribers):
@@ -184,6 +191,13 @@ def reset_workspace(run):
         return {"reset": False, "message": "workspace 尚未创建，跳过重置"}
     git_run(ws, "reset", "--hard", "HEAD")
     git_run(ws, "clean", "-fd", "-e", ".venv", "-e", ".code_agent_deps_ready.json")
+    # 断点会话一并清除（clean 通常已移除，这里显式兜底）
+    session_file = ws / SESSION_FILE_NAME
+    if session_file.is_file():
+        try:
+            session_file.unlink()
+        except OSError:
+            pass
     return {"reset": True, "message": "已恢复到初始状态（保留虚拟环境）"}
 
 
@@ -195,6 +209,7 @@ def read_agent_output(run, proc):
     mode = None            # None | text | result | rag
     text_buf = []
     rag_buf = []
+    result_buf = []
     last_tool = None
     pending_tool = None
 
@@ -212,6 +227,23 @@ def read_agent_output(run, proc):
         if content:
             emit(run, {"type": "rag", "content": content[:6000]})
 
+    def flush_result():
+        # 工具结果摘要：进入日志与工作流步骤的 ↳ 行
+        nonlocal result_buf
+        lines = result_buf
+        result_buf = []
+        if last_tool is None or not lines:
+            return
+        nonempty = [l for l in lines if l.strip()]
+        if not nonempty:
+            return
+        emit(run, {
+            "type": "tool_result",
+            "name": last_tool,
+            "summary": "\n".join(nonempty[:6])[:400],
+            "lines": len(nonempty),
+        })
+
     try:
         for raw in proc.stdout:
             line = raw.rstrip("\r\n")
@@ -220,6 +252,7 @@ def read_agent_output(run, proc):
             if round_m:
                 flush_text()
                 flush_rag()
+                flush_result()
                 mode = None
                 n = int(round_m.group(1))
                 run.round = n
@@ -229,21 +262,25 @@ def read_agent_output(run, proc):
             if line.startswith("========== 修复完成 =========="):
                 flush_text()
                 flush_rag()
+                flush_result()
                 run.success_marker = True
                 continue
 
             if line.startswith("========== 达到最大轮数 =========="):
                 flush_text()
                 flush_rag()
+                flush_result()
                 run.max_rounds = True
                 continue
 
             if line.startswith("========== LLM 调用失败 =========="):
+                flush_result()
                 run.llm_failed = True
                 continue
 
             if line.startswith("Agent："):
                 flush_rag()
+                flush_result()
                 mode = "text"
                 text_buf = []
                 continue
@@ -252,6 +289,7 @@ def read_agent_output(run, proc):
             if m:
                 flush_text()
                 flush_rag()
+                flush_result()
                 pending_tool = m.group(1)
                 mode = None
                 continue
@@ -266,6 +304,7 @@ def read_agent_output(run, proc):
 
             if line.startswith("工具结果"):
                 flush_text()
+                flush_result()
                 if last_tool == "retrieve_code":
                     mode = "rag"
                     rag_buf = []
@@ -274,6 +313,7 @@ def read_agent_output(run, proc):
                 continue
 
             if line.startswith("修改文件："):
+                flush_result()
                 emit(run, {"type": "edited_file", "file": line[len("修改文件："):].strip()})
                 continue
 
@@ -281,6 +321,7 @@ def read_agent_output(run, proc):
             matched = False
             for mark, key in FLAG_MARKS:
                 if line.startswith(mark):
+                    flush_result()
                     set_flag(run, key)
                     matched = True
                     break
@@ -300,6 +341,7 @@ def read_agent_output(run, proc):
                 continue
 
             if mode == "result":
+                result_buf.append(line)
                 # 统计 pytest 结果（真实测试输出）
                 if last_tool in ("run_test", "run_bug_validation"):
                     pm = PASSED_RE.search(line)
@@ -319,6 +361,7 @@ def read_agent_output(run, proc):
 
         flush_text()
         flush_rag()
+        flush_result()
     finally:
         proc.wait()
 
@@ -337,8 +380,10 @@ def build_result(run, success):
     result = {
         "success": bool(success),
         "flags": dict(run.flags),
+        "round": run.round,
         "max_rounds": run.max_rounds,
         "llm_failed": run.llm_failed,
+        "stopped": run.stopped,
         "changed_files": [],
         "diff": "",
     }
@@ -350,12 +395,80 @@ def build_result(run, success):
         result["changed_files"] = [
             l.strip() for l in (names.stdout or "").splitlines() if l.strip()
         ]
+    # 中断后真实的续跑轮次（来自会话文件，而非最后打印的轮次）
+    session = read_session(run.workspace)
+    if session is not None:
+        result["resume_round"] = session["round"]
     return result
 
 
+# 会话文件 state 字段 → 展示状态位的映射
+SESSION_FLAG_MAP = {
+    "edited": "edited",
+    "syntax_passed": "syntax_passed",
+    "tests_passed": "tests_passed",
+    "validation_created": "validation_created",
+    "validation_baseline_confirmed": "baseline_confirmed",
+    "validation_passed": "validation_passed",
+}
+
+
+def read_session(ws):
+    """读取断点会话（Runtime 每轮原子保存的真实状态）。"""
+    if not ws:
+        return None
+    session_file = ws / SESSION_FILE_NAME
+    if not session_file.is_file():
+        return None
+    try:
+        data = json.loads(session_file.read_text(encoding="utf-8"))
+        state = data.get("state", {})
+        return {
+            "round": int(data.get("round_index", 0)),
+            "flags": {rk: bool(state.get(sk)) for sk, rk in SESSION_FLAG_MAP.items()},
+        }
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def start_agent(run, reset=False):
+    ws = run.workspace
+    session = read_session(ws)
+
     if reset:
+        # 用户明确要求从头开始
         reset_workspace(run)
+        session = None
+    elif session is None and ws and (ws / ".git").exists():
+        # 无断点会话：恢复干净的初始状态再开局，
+        # 避免带着上一次的半成品修改让 Agent 误判 baseline
+        reset_workspace(run)
+
+    # ---- 新一次尝试：清空上次的展示状态 ----
+    with run.lock:
+        run.events = []
+        run.round = 0
+        run.success_marker = False
+        run.max_rounds = False
+        run.llm_failed = False
+        run.stopped = False
+        run.result = None
+        for k in run.flags:
+            run.flags[k] = False
+
+    # 断点续跑：用会话文件里的真实状态位初始化展示
+    #（agent.py 恢复时不会重打 ✅ 标记，必须在这里播种）
+    if session is not None:
+        with run.lock:
+            run.round = session["round"]
+            for k, v in session["flags"].items():
+                run.flags[k] = v
+        emit(run, {
+            "type": "resume",
+            "from_round": session["round"],
+            "flags": dict(run.flags),
+            "phase": phase_of(run.flags),
+        })
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -638,7 +751,10 @@ async def api_upload(file: UploadFile = File(...), description: str = Form(...))
         raise HTTPException(500, f"处理上传失败：{e}")
 
     append_task(task_id, "local/upload", "HEAD", description.strip())
-    run = RunState(task_id, "upload", ws, description.strip(), repo="local/upload")
+    run = RunState(
+        task_id, "upload", ws, description.strip(),
+        repo="local/upload", label=filename,
+    )
     RUNS[task_id] = run
 
     return {
@@ -660,7 +776,10 @@ async def api_issue(payload: dict):
     task_id = new_task_id(f"issue_{owner}_{repo}_{number}")
     append_task(task_id, f"{owner}/{repo}", "HEAD", problem)
     ws = WORKSPACE_ROOT / task_id
-    run = RunState(task_id, "issue", ws, problem, repo=f"{owner}/{repo}")
+    run = RunState(
+        task_id, "issue", ws, problem,
+        repo=f"{owner}/{repo}", label=f"{owner}/{repo}#{number}",
+    )
     RUNS[task_id] = run
 
     return {
@@ -690,21 +809,17 @@ def api_repair(payload: dict):
             WORKSPACE_ROOT / task_id,
             entry.get("problem_statement", ""),
             repo=entry.get("repo"),
+            label=entry.get("repo") or task_id,
         )
         RUNS[task_id] = run
 
     if run.status == "running":
         raise HTTPException(409, "该任务正在运行中")
 
-    if run.status == "done":
-        if run.source == "upload":
-            raise HTTPException(409, "上传任务已完成。修复结果基于初始上传内容，请下载 ZIP 或新建任务")
-        if not reset:
-            raise HTTPException(409, "任务已完成。如需重新运行，请勾选「从干净的初始状态开始」")
-
-    if reset and run.source == "upload":
-        raise HTTPException(400, "上传任务没有远端基线，不能重置")
-
+    # 重置 / 断点续跑由服务端按会话文件自动决定：
+    # - 有 .agent_session.json → 断点续跑（LLM 失败、手动终止后不丢轮数）
+    # - 无会话（首次 / 已完成 / 达到最大轮数）→ 干净开局
+    # - reset=True 为用户明确要求从头开始
     start_agent(run, reset=reset)
     return {"task_id": task_id, "started": True, "reset": reset}
 
@@ -718,6 +833,40 @@ def api_status(task_id: str):
     if run.result:
         snap["result"] = run.result
     return snap
+
+
+@app.get("/api/active")
+def api_active():
+    """页面刷新 / 重开后恢复现场用：列出有运行记录的任务。"""
+    runs = sorted(
+        RUNS.values(),
+        key=lambda r: (r.status != "running", -r.created.timestamp()),
+    )
+    out = []
+    for run in runs:
+        if run.status == "created":
+            continue
+        snap = run.snapshot()
+        if run.result:
+            snap["result"] = run.result
+        out.append(snap)
+    return {"tasks": out}
+
+
+@app.post("/api/stop")
+def api_stop(payload: dict):
+    task_id = (payload or {}).get("task_id", "")
+    run = RUNS.get(task_id)
+    if run is None:
+        raise HTTPException(404, f"任务不存在：{task_id}")
+    if run.status != "running" or not run.proc or run.proc.poll() is not None:
+        raise HTTPException(409, "任务不在运行中")
+    run.stopped = True
+    try:
+        run.proc.terminate()
+    except OSError:
+        pass
+    return {"task_id": task_id, "stopped": True}
 
 
 @app.get("/api/stream/{task_id}")

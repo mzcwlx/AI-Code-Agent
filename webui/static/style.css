@@ -98,8 +98,11 @@ h1 { margin:0; font-size:22px; line-height:1.35; }
 .card {
   margin-top:16px; border:1px solid var(--border); border-radius:10px;
   background:var(--panel); overflow:hidden;
+  display:flex; flex-direction:column;
 }
 .grid .card { margin-top:0; }
+/* RETRIEVED CODE 卡片：随左列工作流高度自适应，内部滚动 */
+.card.fill .code-box { flex:1 1 265px; overflow-y:auto; }
 .card-head {
   height:44px; padding:0 15px; border-bottom:1px solid var(--border);
   display:flex; align-items:center; justify-content:space-between;
@@ -131,6 +134,10 @@ h1 { margin:0; font-size:22px; line-height:1.35; }
 }
 .step .message { color:#c3cdda; word-break:break-word; }
 .step .args { color:#67748a; font:11px/1.6 ui-monospace,monospace; word-break:break-all; }
+.step .result {
+  color:#5d697a; font:11px/1.6 ui-monospace,monospace;
+  word-break:break-all; margin-top:3px;
+}
 .agent-note {
   padding:8px 12px; margin:6px 0; border-left:2px solid #2b4a6e;
   color:#9fb0c5; font-size:12.5px; line-height:1.65; white-space:pre-wrap; word-break:break-word;
@@ -141,7 +148,14 @@ h1 { margin:0; font-size:22px; line-height:1.35; }
 .rawlog { border-top:1px solid var(--border); }
 .rawlog summary {
   padding:10px 15px; color:#5d697a; font-size:11px; letter-spacing:1px; cursor:pointer;
+  display:flex; align-items:center; justify-content:space-between; list-style:none;
 }
+.rawlog summary::-webkit-details-marker { display:none; }
+.link-btn {
+  background:none; border:1px solid var(--border); color:#8b97a8;
+  font-size:10px; padding:3px 10px; border-radius:5px; font-weight:600;
+}
+.link-btn:hover { color:#cfe0f5; border-color:#2b4a6e; }
 .rawlog pre {
   margin:0; padding:0 15px 14px; max-height:220px; overflow-y:auto;
   color:#67748a; font:11px/1.7 ui-monospace,monospace; white-space:pre-wrap; word-break:break-all;
@@ -150,7 +164,7 @@ h1 { margin:0; font-size:22px; line-height:1.35; }
 /* ---------- 代码 / diff ---------- */
 .code-box,.diff { padding:15px; background:#0b0f14; min-height:265px; }
 pre { margin:0; color:#9caabd; font:12px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; }
-#ragCode { max-height:340px; overflow-y:auto; word-break:break-all; }
+#ragCode { word-break:break-all; }
 .diff { min-height:90px; font:12px/2.0 ui-monospace,SFMono-Regular,monospace; }
 .diff .dline { padding:2px 8px; white-space:pre-wrap; word-break:break-all; }
 .diff .ctx { color:#7d8a9c; }
@@ -173,6 +187,10 @@ pre { margin:0; color:#9caabd; font:12px/1.7 ui-monospace,SFMono-Regular,Consola
 .dl-btn:hover { background:#37c284; }
 #resultBadge.pass { color:var(--green); }
 #resultBadge.fail { color:var(--red); }
+
+.hero-actions { display:flex; gap:10px; }
+.stop-btn { background:#2a1620; border:1px solid #6e2f45; color:#ff9fb0; }
+.stop-btn:hover { background:#3a1f2b; }
 
 @media (max-width:900px) {
   .layout { grid-template-columns:1fr; }
