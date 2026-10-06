@@ -1191,12 +1191,20 @@ def run_test(test_path=None, test_filter=None):
     else:
         status = "FAIL"
 
-    return {
+    result_payload = {
         "status": status,
         "command": " ".join(command),
         "returncode": result.returncode,
         "output": output[-12000:]
     }
+
+    if status == "FAIL":
+        # 附带结构化失败详情（失败测试条目 + FAILURES 段源码帧），
+        # agent 层用 frame_paths 与被修改文件比对，
+        # 判定失败是否由本次修改引起。
+        result_payload.update(_parse_pytest_failures(output))
+
+    return result_payload
 
 
 # ============================================================
@@ -1522,11 +1530,238 @@ def create_bug_validation(test_code):
     }
 
 
+# ============================================================
+# pytest 失败输出解析（run_bug_validation 专用）
+# ============================================================
+
+# 断言失败相关类型：这是"有效 baseline FAIL"的证据，
+# 说明 Bug 被成功复现，而不是验证测试自身写错。
+_ASSERTION_FAILURE_NAMES = {
+    "AssertionError",
+    "Failed",
+}
+
+# 常见"测试自身错误"异常类型：验证测试调用了不存在的 API、
+# 传错参数或导入失败时抛出，无论源代码是否修复都会失败。
+_TEST_ERROR_EXCEPTION_NAMES = {
+    "TypeError",
+    "AttributeError",
+    "ImportError",
+    "ModuleNotFoundError",
+    "NameError",
+    "UnboundLocalError",
+    "SyntaxError",
+    "IndentationError",
+    "KeyError",
+    "IndexError",
+    "ValueError",
+    "RuntimeError",
+    "ZeroDivisionError",
+    "FileNotFoundError",
+    "FileExistsError",
+    "NotADirectoryError",
+    "IsADirectoryError",
+    "PermissionError",
+    "RecursionError",
+    "StopIteration",
+    "StopAsyncIteration",
+    "OSError",
+    "IOError",
+    "TimeoutError",
+    "ArithmeticError",
+    "LookupError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+}
+
+# pytest 输出中异常类型出现的三类位置：
+# 1) "E   TypeError: ..." / "E   pkg.mod.CustomError: ..." 错误行；
+# 2) 摘要行 "FAILED path::test - TypeError: ..." /
+#    "ERROR path::test - ImportError: ..."；
+# 3) traceback 尾行 ".../test_x.py:12: AssertionError"。
+_E_LINE_PATTERN = re.compile(
+    r"^E\s+(?:[\w.]+\.)?([A-Za-z_][A-Za-z0-9_]*)",
+    re.MULTILINE
+)
+
+_SUMMARY_LINE_PATTERN = re.compile(
+    r"^(?:FAILED|ERROR)\s+\S+\s+-\s+(?:[\w.]+\.)?([A-Za-z_][A-Za-z0-9_]*)",
+    re.MULTILINE
+)
+
+_TRACEBACK_TAIL_PATTERN = re.compile(
+    r"^(?:[A-Za-z]:)?[\w./\\-]+\.py:\d+:\s*([A-Za-z_][A-Za-z0-9_]*)\s*$",
+    re.MULTILINE
+)
+
+
+def _parse_pytest_failure(output):
+    """
+    解析 pytest FAIL 输出，区分断言失败与测试自身错误。
+
+    不能只依赖 "^E\\s+XxxError" 单一正则：
+    - 断言失败：E 行是 "E   assert ..."，traceback 尾行为
+      "...: AssertionError"；
+    - 测试函数内部异常：E 行直接是异常类型
+      （TypeError / AttributeError / ImportError / ...）；
+    - fixture setup 失败：出现 "_ ERROR at setup of ..." 段；
+    - 收集/导入失败：出现 "ERROR collecting ..." 段。
+
+    返回 dict：
+      failure_kind: "assertion" / "test_error" /
+                    "collection_error" / "unknown"
+      error_types:  排序去重后的异常类型名列表
+    """
+
+    error_types = set()
+
+    for pattern in (
+        _E_LINE_PATTERN,
+        _SUMMARY_LINE_PATTERN,
+        _TRACEBACK_TAIL_PATTERN,
+    ):
+        for match in pattern.finditer(output):
+            error_types.add(match.group(1))
+
+    assertion_hits = error_types & _ASSERTION_FAILURE_NAMES
+
+    # 注意：AssertionError / Failed 本身也以 "Error" 结尾，
+    # 必须先从"测试自身错误"集合中排除，否则纯断言失败
+    # （baseline 的合法复现证据）会被误判成 test_error。
+    error_hits = {
+        name
+        for name in error_types
+        if name not in _ASSERTION_FAILURE_NAMES
+        and (
+            name in _TEST_ERROR_EXCEPTION_NAMES
+            or name.endswith("Error")
+            or name.endswith("Exception")
+        )
+    }
+
+    if re.search(
+        r"^_+ ERROR collecting |^ERROR collecting ",
+        output,
+        re.MULTILINE
+    ):
+        # 收集阶段失败：测试（或其导入的模块）跑不起来，
+        # 其 E 行中的 ImportError 等只是失败原因，不单判定。
+        failure_kind = "collection_error"
+    elif error_hits:
+        failure_kind = "test_error"
+    elif re.search(
+        r"^_+ ERROR at setup of ",
+        output,
+        re.MULTILINE
+    ):
+        # fixture 自身抛错（可能是自定义异常类型，
+        # E 行识别不出来），同样属于测试自身错误。
+        failure_kind = "test_error"
+    elif assertion_hits:
+        failure_kind = "assertion"
+    else:
+        # 无法识别时保守处理：默认按断言失败对待，
+        # 避免把真实 Bug 复现误判成验证测试损坏。
+        failure_kind = "unknown"
+
+    return {
+        "failure_kind": failure_kind,
+        "error_types": sorted(error_hits | assertion_hits)
+    }
+
+
+# run_test FAIL 输出的失败条目：短摘要行形如
+#   FAILED tests/test_x.py::test_case - AssertionError: assert 1 == 2
+#   ERROR tests/test_x.py::test_case - ImportError: No module named 'x'
+# 错误类型要求大写开头，避免把 "- assert ..." 误认成异常类型。
+_FAILED_SUMMARY_ENTRY_PATTERN = re.compile(
+    r"^(?:FAILED|ERROR)\s+(?!collecting\s)(\S+)"
+    r"(?:\s+-\s+([A-Z][A-Za-z0-9_]*))?",
+    re.MULTILINE
+)
+
+# traceback 中出现的源码帧路径，形如
+#   D:\proj\src\module.py:42        （断言/异常抛出点）
+#   src/module.py:42: in buggy_func （调用链中间帧）
+_FRAME_PATH_PATTERN = re.compile(
+    r"(?:[A-Za-z]:)?[^\s'\"\[\](){}]*\.py:\d+"
+)
+
+
+def _pytest_failure_region(output):
+    """
+    截取 pytest 输出中的 FAILURES 段。
+
+    帧路径只从该段提取：warnings summary 等其他段也可能提到
+    被修改文件的路径（如弃用警告指向导入点），混入后会把
+    与本次修改无关的失败误判成相关失败。
+
+    找不到 FAILURES 标记时保守退回整个输出
+    （宁可把失败误判成相关，也不放过该阻断的情况）。
+    """
+    start = output.find("=== FAILURES ===")
+    if start == -1:
+        return output
+    end = len(output)
+    for marker in (
+        "=== short test summary info ===",
+        "=== warnings summary ===",
+    ):
+        pos = output.find(marker, start + 1)
+        if pos != -1:
+            end = min(end, pos)
+    return output[start:end]
+
+
+def _parse_pytest_failures(output):
+    """
+    解析 run_test 的 FAIL 输出，提取：
+    - failures:     每个失败测试的条目 {test_id, error_type}
+    - frame_paths:  FAILURES 段 traceback 中的所有 .py:N 源码帧路径
+
+    agent 层用 frame_paths 判定失败是否由本次修改引起：
+    如果被修改文件没有出现在任何失败的 traceback 调用链里，
+    本次修改不可能导致这些失败（同进程 pytest 语义），
+    即可记录为"与本次修改无关的失败"，不阻断完成条件。
+    """
+    failures = []
+    for match in _FAILED_SUMMARY_ENTRY_PATTERN.finditer(output):
+        failures.append({
+            "test_id": match.group(1),
+            "error_type": match.group(2)
+        })
+
+    failure_region = _pytest_failure_region(output)
+    frame_paths = []
+    seen = set()
+    for match in _FRAME_PATH_PATTERN.finditer(failure_region):
+        path = match.group(0)
+        if path not in seen:
+            seen.add(path)
+            frame_paths.append(path)
+
+    return {
+        "failures": failures,
+        "frame_paths": frame_paths
+    }
+
+
 def run_bug_validation():
     """
-    运行 .agent_validation/test_bug_validation.py。
+    运行 .agent_validation/test_bug_validation.py 并解析失败原因。
 
     不通过 replace_in_file 修改测试文件。
+
+    状态语义（tools 层只负责解析，不负责终审路由）：
+    - PASS / NO_TESTS / TIMEOUT：原样返回；
+    - INTERRUPTED / INTERNAL_ERROR / USAGE_ERROR：返回
+      BROKEN_TEST（收集/导入阶段失败）；
+    - FAIL：解析 traceback 后附带 failure_kind
+      （assertion / test_error / collection_error / unknown）
+      与 error_types 返回。是否按 BROKEN_TEST 处理由
+      agent 层根据 validation_baseline_confirmed 状态决定——
+      baseline 确认之后，任何 FAIL 都必须走源码修复路径，
+      不允许再降级为 BROKEN_TEST。
     """
 
     if ACTIVE_WORKSPACE is None:
@@ -1550,67 +1785,23 @@ def run_bug_validation():
         test_path=validation_path
     )
 
-    # --------------------------------------------------------
-    # 验证测试质量检查：
-    # baseline 失败必须是 AssertionError（断言失败）。
-    # 如果是 AttributeError / TypeError / ImportError 等，
-    # 说明验证测试自身调用了不存在的 API 或写错了代码，
-    # 这样的测试无论代码是否修复都会一直失败，不能作为 baseline。
-    # --------------------------------------------------------
+    if not isinstance(result, dict):
+        return result
 
-    if isinstance(result, dict) and result.get("status") == "FAIL":
-        output = result.get("output", "")
-
-        error_types = set(
-            re.findall(
-                r"^E\s+([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))",
-                output,
-                re.MULTILINE
-            )
-        )
-
-        broken_types = sorted(
-            error_types - {"AssertionError", "Failed"}
-        )
-
-        if broken_types:
-            return {
-                "status": "BROKEN_TEST",
-                "error_types": broken_types,
-                "message": (
-                    "验证测试自身存在错误，失败原因是 "
-                    f"{ '、'.join(broken_types) }"
-                    "（不是 AssertionError 断言失败）。\n"
-                    "这通常意味着测试代码调用了不存在的 API、"
-                    "传错了参数或导入失败，无论源代码是否修复，"
-                    "该测试都会失败。\n"
-                    "请根据 traceback 修正验证测试：\n"
-                    "1. 用真实存在的 API 重写测试；\n"
-                    "2. 如果目标 Bug 的表现形式就是异常，"
-                    "请在测试中用 try/except 捕获后 "
-                    "pytest.fail，或断言修复后的正确行为；\n"
-                    "3. 重新调用 create_bug_validation 创建修正后的测试，"
-                    "再运行 baseline。"
-                ),
-                "output": output[-8000:]
-            }
+    status = result.get("status")
+    output = result.get("output", "")
 
     # --------------------------------------------------------
     # 收集阶段的错误（INTERRUPTED = returncode 2 等）：
     # 测试文件本身导入/语法有问题，无论源代码是否修复都跑不起来，
-    # 同样属于 BROKEN_TEST，必须修正后重新创建。
+    # 属于 BROKEN_TEST，必须修正后重新创建。
     # --------------------------------------------------------
 
-    if isinstance(result, dict) and result.get("status") in (
-        "INTERRUPTED",
-        "INTERNAL_ERROR",
-        "USAGE_ERROR"
-    ):
-        output = result.get("output", "")
-
+    if status in ("INTERRUPTED", "INTERNAL_ERROR", "USAGE_ERROR"):
         return {
             "status": "BROKEN_TEST",
             "error_types": ["CollectionError"],
+            "failure_kind": "collection_error",
             "message": (
                 "验证测试无法运行：pytest 在收集阶段就出错"
                 "（导入失败 / 语法错误 / 用法错误），"
@@ -1621,6 +1812,59 @@ def run_bug_validation():
             ),
             "output": output[-8000:]
         }
+
+    # --------------------------------------------------------
+    # FAIL：解析 traceback，区分断言失败与测试自身错误。
+    # 注意：这里不再直接把 FAIL 改判为 BROKEN_TEST——
+    # baseline 确认之后，任何 FAIL（包括测试自身抛错）都必须
+    # 保持 FAIL，走"修复源代码"路径；是否降级为 BROKEN_TEST
+    # 由 agent 层根据 validation_baseline_confirmed /
+    # validation_frozen 状态在 baseline 之前路由。
+    # --------------------------------------------------------
+
+    if status == "FAIL":
+        parsed = _parse_pytest_failure(output)
+        failure_kind = parsed["failure_kind"]
+        error_types = parsed["error_types"]
+
+        if failure_kind == "assertion":
+            guidance = (
+                "这是 AssertionError 断言失败（有效失败证据）："
+                "如果尚未修改源代码，说明 Bug 成功复现。"
+                "禁止修改本验证测试。"
+            )
+        elif failure_kind == "test_error":
+            guidance = (
+                "这不是断言失败，而是测试函数内部抛出了异常"
+                "（常见：调用了不存在的 API、传错参数、导入失败），"
+                "无论源代码是否修复该测试都会失败。\n"
+                "如果尚未建立 baseline，应根据 traceback 用真实存在的 "
+                "API 重写验证测试，并重新调用 create_bug_validation。"
+            )
+        elif failure_kind == "collection_error":
+            guidance = (
+                "pytest 在收集阶段失败：验证测试（或其导入的源模块）"
+                "存在导入/语法错误。\n"
+                "如果尚未建立 baseline，应根据 traceback 重写验证测试"
+                "并重新调用 create_bug_validation。"
+            )
+        else:
+            guidance = (
+                "无法从输出中识别出明确的异常类型，默认按断言失败处理。"
+                "请阅读完整 traceback 判断失败原因。"
+            )
+
+        result = dict(result)
+        result["failure_kind"] = failure_kind
+        result["error_types"] = error_types
+        result["message"] = (
+            "验证测试失败。"
+            f"失败类型：{failure_kind}；"
+            f"涉及异常：{ '、'.join(error_types) or '未识别' }。\n"
+            + guidance
+        )
+        result["output"] = output[-8000:]
+        return result
 
     return result
 

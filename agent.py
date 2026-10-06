@@ -128,10 +128,26 @@ validation_failed = False
 validation_broken = False
 validation_is_probe = False
 
+# baseline 确认后的永久冻结标志：一旦在未修改代码上确认
+# 原始 Bug 可复现（AssertionError 型 FAIL），当前验证测试
+# 就被永久冻结——禁止 create_bug_validation 重建、禁止
+# 修改验证测试文件；此后任何验证 FAIL（包括收集/导入错误）
+# 都只能通过修复源代码解决。该标志在会话中永不清除。
+validation_frozen = False
+
 # run_test 是否返回过 NO_TESTS（项目没有可运行的现有 pytest 测试）。
 # NO_TESTS ≠ 修复失败：一旦为 True，Runtime 禁止再次调用 run_test，
 # 测试阶段视为完成，最终验证交给 run_bug_validation。
 no_tests_seen = False
+
+# 相关测试是否通过（run_test 结论中与本次修改相关的部分）。
+# 与 tests_passed 的区别：现有测试中存在与本次修改无关的失败时
+# （unrelated_test_failures 非空），relevant_tests_passed 仍为 True，
+# 不阻断修复流程；五元组完成条件与 phase 判定均以本变量为准。
+relevant_tests_passed = False
+
+# 与本次修改无关的失败测试 id 列表（run_test UNRELATED 场景收集）
+unrelated_test_failures = []
 
 # 当前修改后的文件
 last_edited_file = None
@@ -568,6 +584,13 @@ Bug 原因分析
 
 不要依赖任何针对具体仓库、Issue 编号、类名或 Bug 的硬编码检查。
 
+修复机制优先级：problem statement 明确指出的机制与行为描述
+优先于你自己猜测的替代实现。
+- problem statement 明确描述了失败机制时，按描述的机制定位和修复；
+- 只有 problem statement 没有给出机制线索时，才基于真实代码自行推理；
+- 你的猜测与 problem statement 或真实代码冲突时，
+  以 problem statement 和真实代码为准，放弃自己的猜测。
+
 如果现有 pytest 已经直接覆盖原始 Bug，可以直接使用相关测试。
 如果现有测试不能证明原始 Bug 已被修复，则必须：
 
@@ -579,6 +602,14 @@ Bug 原因分析
 6. check_syntax → run_test；
 7. 再次调用 run_bug_validation；
 8. 只有第二次 PASS 才能把原始 Bug 视为真正修复。
+
+baseline 确认（第 4 步）之后，这个验证测试会被永久冻结：
+
+- 禁止重新调用 create_bug_validation；
+- 禁止修改、重建或替换该验证测试（Runtime 会直接拦截）；
+- 此后任何 run_bug_validation FAIL 都只有一个含义——
+  当前修改没有真正修复原始 Bug；
+- 唯一出路是重新分析并修改源代码，绝不是改验证测试。
 
 临时验证测试：
 - 不得修改项目 tests；
@@ -835,7 +866,10 @@ run_test
 5. replace_lines 返回成功
 6. 修改后的代码通过 check_syntax
 7. 修改后的代码经过测试阶段：
-   - 如果项目存在相关 pytest，则 run_test 必须 PASS；
+   - 如果项目存在相关 pytest，则与本次修改相关的测试必须全部通过；
+     现有测试中与本次修改无关的失败（Runtime 会标记
+     failure_relevance = UNRELATED）不阻断完成，
+     也不要去修复它们或修改对应测试；
    - 如果项目没有现有测试，则 run_test 返回 NO_TESTS，
      不视为失败，必须由 run_bug_validation 完成最终验证。
 8. 最终 run_bug_validation 必须 PASS。
@@ -1012,11 +1046,34 @@ if resumed_session is not None:
         False
     )
 
+    # 旧版本会话文件没有 validation_frozen 字段，默认 False。
+    # 冻结是永久状态：恢复后依然生效，禁止解冻。
+    globals()["validation_frozen"] = saved_state.get(
+        "validation_frozen",
+        False
+    )
+
     # 旧版本会话文件没有 no_tests_seen 字段，默认 False，
     # 保证恢复后 NO_TESTS → 禁止 run_test 的规则仍然生效
     globals()["no_tests_seen"] = saved_state.get(
         "no_tests_seen",
         False
+    )
+
+    # 旧版本会话文件没有这两个字段，默认 False / []。
+    # 相关性结论是完成条件五元组的组成部分：
+    # "现有测试有无关失败但不阻断完成"的状态断点恢复后必须还原，
+    # 否则恢复后会卡在 run_test 阶段（而无关失败可能永远无法消除）。
+    globals()["relevant_tests_passed"] = saved_state.get(
+        "relevant_tests_passed",
+        False
+    )
+
+    globals()["unrelated_test_failures"] = list(
+        saved_state.get(
+            "unrelated_test_failures",
+            []
+        )
     )
 
     read_files.clear()
@@ -1169,13 +1226,82 @@ def repeat_strategy_hint():
     if edited and not syntax_passed:
         return "\n当前应调用 check_syntax。"
 
-    if edited and syntax_passed and not tests_passed:
+    # 与 next_required_action 的 run_test 分支保持一致：
+    # 用 relevant_tests_passed 而不是 tests_passed，
+    # 无关失败场景不应再引导重复 run_test。
+    if edited and syntax_passed and not relevant_tests_passed:
         return (
             "\n当前应调用 run_test 验证修改，"
             "或继续 replace_lines 修复剩余问题。"
         )
 
     return ""
+
+
+def _is_validation_test_path(path):
+    """
+    判断目标路径是否指向临时验证测试目录（.agent_validation/）。
+
+    用于 Runtime Guard：验证测试只能通过 create_bug_validation
+    整体重写（且仅限 baseline 确认之前），绝不允许被
+    replace_lines 等编辑工具逐行修改。
+    """
+    if not isinstance(path, str):
+        return False
+
+    normalized = path.replace("\\", "/").strip().strip("/").lower()
+
+    return (
+        normalized == VALIDATION_DIR_NAME
+        or normalized.startswith(VALIDATION_DIR_NAME + "/")
+        or f"/{VALIDATION_DIR_NAME}/" in f"/{normalized}/"
+    )
+
+
+def _frame_matches_edited_file(frame, edited_file):
+    """
+    判断 traceback 中的一个源码帧路径是否指向被修改的文件。
+
+    frame 形如 "src/foo.py:42" 或 "D:\\proj\\src\\foo.py:42"；
+    edited_file 是 replace_lines 成功后的文件路径
+    （相对 / 绝对、正斜杠 / 反斜杠均可能出现）。
+    双向做路径后缀匹配，并统一盘符、斜杠与大小写差异。
+    """
+    if (
+        not isinstance(frame, str)
+        or not isinstance(edited_file, str)
+        or not frame
+        or not edited_file
+    ):
+        return False
+
+    frame_norm = frame.replace("\\", "/").strip().lower()
+
+    # 去掉行号后缀（...:42）
+    head, _, tail = frame_norm.rpartition(":")
+    if tail.isdigit():
+        frame_norm = head
+
+    # 去掉 Windows 盘符（d:/... → /...）
+    if len(frame_norm) >= 2 and frame_norm[1] == ":":
+        frame_norm = frame_norm[2:]
+
+    edited_norm = edited_file.replace("\\", "/").strip().lower()
+
+    if len(edited_norm) >= 2 and edited_norm[1] == ":":
+        edited_norm = edited_norm[2:]
+
+    while edited_norm.startswith("./"):
+        edited_norm = edited_norm[2:]
+
+    if not frame_norm or not edited_norm:
+        return False
+
+    return (
+        frame_norm == edited_norm
+        or frame_norm.endswith("/" + edited_norm)
+        or edited_norm.endswith("/" + frame_norm)
+    )
 
 
 # ============================================================
@@ -1198,7 +1324,7 @@ def current_phase():
     if (
         edited
         and syntax_passed
-        and tests_passed
+        and relevant_tests_passed
         and validation_created
         and validation_baseline_confirmed
         and validation_passed
@@ -1234,18 +1360,24 @@ def current_phase():
 
 def next_required_action():
     """把 Runtime 已知状态转换成唯一的优先动作。"""
-    if edited and syntax_passed and tests_passed and validation_passed:
+    # 完成条件五元组：修改 + 语法 + 相关测试通过
+    # + baseline 确认 + 最终验证通过。
+    # 注意用的是 relevant_tests_passed 而不是 tests_passed：
+    # 与本次修改无关的现有测试失败不阻断完成。
+    if (edited and syntax_passed and relevant_tests_passed
+                and validation_baseline_confirmed and validation_passed):
         return "STOP: 已满足完成条件，不再调用工具。"
     if edited and syntax_passed and validation_failed:
         # 最终回归验证失败：必须重新修改代码，而不是重复运行验证
         return "replace_lines（回归验证失败，重新修改代码）"
-    if edited and syntax_passed and not tests_passed and no_tests_seen:
+    if edited and syntax_passed and not relevant_tests_passed and no_tests_seen:
         # NO_TESTS：项目没有现有 pytest 测试，禁止 run_test，
         # 直接进行最终 Bug 回归验证
         return "run_bug_validation"
-    if edited and syntax_passed and tests_passed and validation_created and not validation_passed:
+    if (edited and syntax_passed and relevant_tests_passed
+                and validation_created and not validation_passed):
         return "run_bug_validation"
-    if edited and syntax_passed and not tests_passed:
+    if edited and syntax_passed and not relevant_tests_passed:
         return "run_test"
     if edited and not syntax_passed:
         return "check_syntax"
@@ -1310,6 +1442,8 @@ edited: {edited}
 last_edited_file: {last_edited_file or '无'}
 syntax_passed: {syntax_passed}
 tests_passed: {tests_passed}
+relevant_tests_passed: {relevant_tests_passed}
+unrelated_test_failures: {", ".join(unrelated_test_failures) or '无'}
 validation_failed: {validation_failed}
 validation_broken: {validation_broken}
 validation_passed: {validation_passed}
@@ -1369,7 +1503,10 @@ for round_number in range(start_round, MAX_ROUNDS):
             "validation_failed": validation_failed,
             "validation_broken": validation_broken,
             "validation_is_probe": validation_is_probe,
+            "validation_frozen": validation_frozen,
             "no_tests_seen": no_tests_seen,
+            "relevant_tests_passed": relevant_tests_passed,
+            "unrelated_test_failures": list(unrelated_test_failures),
             "evidence_ready": evidence_ready,
             "retrieve_count": retrieve_count,
             "consecutive_reads": consecutive_reads,
@@ -1412,10 +1549,11 @@ for round_number in range(start_round, MAX_ROUNDS):
         print(f"\n⚠️ 会话进度保存失败：{e}")
 
     # --------------------------------------------------------
-    # 如果已经修改 + 测试通过
+    # 如果已经修改 + 相关测试通过 + 最终验证通过（五元组）
     # --------------------------------------------------------
 
-    if (edited and syntax_passed and tests_passed and validation_created
+    if (edited and syntax_passed and relevant_tests_passed
+                and validation_created
                 and validation_baseline_confirmed and validation_passed):
 
         print("\n========== 修复完成 ==========")
@@ -1491,7 +1629,11 @@ for round_number in range(start_round, MAX_ROUNDS):
         # 真正完成
         # ----------------------------------------------------
 
-        if (edited and syntax_passed and tests_passed and validation_created
+        # 完成条件五元组：与本次修改无关的现有测试失败
+        # （relevant_tests_passed=True 而 tests_passed=False）
+        # 不阻断完成。
+        if (edited and syntax_passed and relevant_tests_passed
+                and validation_created
                 and validation_baseline_confirmed and validation_passed):
 
             print(
@@ -1581,6 +1723,30 @@ check_syntax
 run_test
 """
 
+        elif validation_failed and validation_frozen:
+
+            # 冻结状态：验证测试不可重建、不可修改，
+            # 与 Runtime Guard 的拦截行为保持一致
+            # （create_bug_validation 会被直接拦截）。
+            continuation = """
+最终 Bug 回归验证失败。
+
+验证测试已在 baseline 确认时永久冻结：
+禁止重新调用 create_bug_validation，
+禁止修改、重建或替换验证测试（Runtime 会直接拦截）。
+
+最终验证 FAIL 只有一个含义：当前修改没有真正修复原始 Bug。
+
+请根据验证失败的真实输出重新分析：
+1. 必要时 read_file 阅读真实代码；
+2. 调用 replace_lines 修正真正的缺陷；
+3. check_syntax；
+4. run_test（若 run_test 曾返回 NO_TESTS，跳过此步并禁止再调用）；
+5. 再次 run_bug_validation。
+
+禁止修改 tests。
+"""
+
         elif validation_failed:
 
             continuation = """
@@ -1623,7 +1789,7 @@ run_bug_validation
 不要结束任务。
 """
 
-        elif edited and syntax_passed and not tests_passed:
+        elif edited and syntax_passed and not relevant_tests_passed:
 
             continuation = """
 代码已经修改，并且语法检查已经通过。
@@ -1633,13 +1799,14 @@ run_bug_validation
 run_test
 
 使用与问题直接相关的测试。
+如果 run_test 失败且失败与本次修改相关，先修复源代码再重试。
 不要结束任务。
 """
 
         elif (
             edited
             and syntax_passed
-            and tests_passed
+            and relevant_tests_passed
             and validation_created
             and not validation_passed
         ):
@@ -1926,7 +2093,32 @@ retrieve_code 已达上限，
 
             allowed = allowed_tools_for_phase()
 
-            if tool_name not in allowed:
+            # 冻结专属拦截必须优先于阶段白名单：
+            # baseline 确认后 validation_frozen 恒为 True，此时阶段
+            # 至少是 REPAIR，create_bug_validation 不在后期阶段白名单
+            # 中——若先走阶段拦截，冻结专属文案永远不可达，且通用
+            # 阶段文案会让 LLM 误以为只是阶段不对、稍后重试即可。
+            # 这里对"冻结后重建验证测试"单独返回冻结专属 BLOCKED
+            # 文案（调用本身依然被拒绝，不会放松任何白名单约束）。
+            if (
+                tool_name == "create_bug_validation"
+                and validation_frozen
+            ):
+                result = {
+                    "status": "BLOCKED",
+                    "message": (
+                        "Bug validation 已完成 baseline 并被冻结，"
+                        "禁止重新创建或修改验证测试。"
+                        "最终验证失败必须修复源代码。"
+                    )
+                }
+                print(
+                    "\n🔒 Runtime Guard："
+                    "validation 已冻结，禁止重建验证测试"
+                )
+                tool = None
+
+            elif tool_name not in allowed:
                 result = {
                     "status": "BLOCKED",
                     "message": (
@@ -1994,6 +2186,31 @@ retrieve_code 已达上限，
 
                     elif (
                         tool_name == "replace_lines"
+                        and _is_validation_test_path(
+                            arguments.get("path")
+                        )
+                    ):
+                        # requests_6629 失败模式：最终验证 FAIL 后
+                        # LLM 试图用编辑工具修改验证测试本身。
+                        # 必须在 tools 层 PermissionError 之前
+                        # 给出结构化 BLOCKED 消息，而不是异常字符串。
+                        result = {
+                            "status": "BLOCKED",
+                            "message": (
+                                "验证测试文件（.agent_validation/）只能通过 "
+                                "create_bug_validation 整体重写，"
+                                "禁止用 replace_lines 等编辑工具修改。\n"
+                                "最终验证失败时，必须修复源代码，"
+                                "而不是修改验证测试。"
+                            )
+                        }
+                        print(
+                            "\n⚠️ Runtime Guard："
+                            "禁止用编辑工具修改验证测试文件"
+                        )
+
+                    elif (
+                        tool_name == "replace_lines"
                         and not validation_created
                     ):
                         result = {
@@ -2011,6 +2228,26 @@ retrieve_code 已达上限，
                             "message": "原始 Bug 尚未完成修改前 baseline 验证，不能修改源代码。必须先 run_bug_validation 并确认 FAIL。"
                         }
                         print("\n⚠️ Runtime Guard：必须先确认 Bug baseline")
+
+                    elif (
+                        tool_name == "create_bug_validation"
+                        and validation_frozen
+                    ):
+                        # 永久冻结：baseline 确认后禁止重建验证测试。
+                        # 该分支优先于下方的 edited 检查——即使 Agent
+                        # 已修改代码，冻结状态也不允许重新创建。
+                        result = {
+                            "status": "BLOCKED",
+                            "message": (
+                                "Bug validation 已完成 baseline 并被冻结，"
+                                "禁止重新创建或修改验证测试。"
+                                "最终验证失败必须修复源代码。"
+                            )
+                        }
+                        print(
+                            "\n🔒 Runtime Guard："
+                            "validation 已冻结，禁止重建验证测试"
+                        )
 
                     elif (
                         tool_name == "create_bug_validation"
@@ -2099,6 +2336,31 @@ retrieve_code 已达上限，
                             "message": "代码已经修改，但尚未通过 check_syntax。"
                         }
                         print("\n⚠️ Runtime Guard：禁止跳过语法检查")
+
+                    elif (
+                        tool_name == "run_bug_validation"
+                        and edited
+                        and validation_baseline_confirmed
+                        and validation_failed
+                    ):
+                        # 最终验证失败后，如果没有成功的源代码修改
+                        # （replace_lines SUCCESS 会重置 validation_failed），
+                        # 重复运行验证测试结果不会变化。验证测试已被冻结，
+                        # 唯一出路是修复源代码。
+                        result = {
+                            "status": "BLOCKED",
+                            "message": (
+                                "上一次最终验证失败，且此后没有修改源代码。"
+                                "验证测试已被冻结，重复运行结果不会变化。\n"
+                                "必须先用 replace_lines 修复源代码"
+                                "（每次成功修改后可再次运行验证），"
+                                "或运行 run_test 检查现有测试。"
+                            )
+                        }
+                        print(
+                            "\n⚠️ Runtime Guard："
+                            "最终验证失败后必须先修复源代码"
+                        )
 
                     elif (
                         tool_name == "run_test"
@@ -2192,6 +2454,9 @@ retrieve_code 已达上限，
 
         if tool_name == "create_bug_validation":
             if isinstance(result, dict) and result.get("status") == "CREATED":
+                # 注意：这里绝不触碰 validation_frozen。
+                # 冻结是永久状态，且上游守卫在冻结后根本不会放行
+                # create_bug_validation，此分支只在 baseline 之前可达。
                 validation_created = True
                 validation_baseline_confirmed = False
                 validation_passed = False
@@ -2216,6 +2481,15 @@ retrieve_code 已达上限，
                     "\n⚠️ 验证测试创建失败：预检发现导入/语法错误"
                     "（BROKEN_TEST）"
                 )
+            elif isinstance(result, dict) and result.get("status") == "BLOCKED":
+                # Runtime Guard（冻结守卫 / 阶段白名单等）拦截产生的
+                # BLOCKED 不是一次新的创建结果：绝不能落入下方 else
+                # 分支把 validation_created 等状态重置——否则一旦冻结，
+                # create_bug_validation 永远被拦截、validation_created
+                # 永远被清空、run_bug_validation 又被"尚未创建"守卫
+                # 拦截，任务陷入无法完成的死锁（livelock）。
+                # 被拦截的调用不改变任何验证状态。
+                pass
             else:
                 validation_created = False
                 validation_baseline_confirmed = False
@@ -2232,8 +2506,17 @@ retrieve_code 已达上限，
             if isinstance(result, dict):
                 status = result.get("status")
 
+                if status == "BLOCKED":
+                    # Runtime Guard（尚未创建验证 / 阶段白名单等）拦截
+                    # 产生的 BLOCKED 不是真实验证结果：保持现有验证
+                    # 状态不变，绝不能落入下方分支把它当作
+                    # "回归验证未通过"——那会虚假翻转
+                    # validation_failed / tests_passed，
+                    # 误导 current_phase 回退、破坏完成条件。
+                    pass
+
                 # 修改前失败 = 原始 Bug 成功复现，这是有效证据。
-                if not edited and status == "BROKEN_TEST":
+                elif not edited and status == "BROKEN_TEST":
                     validation_baseline_confirmed = False
                     validation_passed = False
                     validation_failed = False
@@ -2247,7 +2530,40 @@ retrieve_code 已达上限，
 
                 elif not edited and status == "FAIL":
 
-                    if validation_is_probe:
+                    failure_kind = result.get("failure_kind")
+
+                    if failure_kind in ("test_error", "collection_error"):
+                        # baseline 之前：验证测试自身抛出 TypeError /
+                        # ImportError 等真实异常，或收集/导入失败。
+                        # 这不是 Bug 复现证据（修复方案应让测试用
+                        # pytest.raises 显式断言预期异常），按
+                        # BROKEN_TEST 流转，必须修正测试本身。
+                        # 注意：baseline 确认之后（冻结状态）绝不走
+                        # 这个分支——下方 edited 分支保证任何 FAIL
+                        # 都保持 FAIL，走修复源代码路径。
+                        validation_baseline_confirmed = False
+                        validation_passed = False
+                        validation_failed = False
+                        validation_broken = True
+
+                        result["guidance"] = (
+                            "验证测试失败原因是测试自身异常"
+                            "（" + str(result.get("error_types")) + "），"
+                            "不是对 Bug 的断言失败。\n"
+                            "如果该异常本身就是目标 Bug 的表现，"
+                            "请在测试中用 pytest.raises(异常类型) "
+                            "显式断言，让复现结果变成 AssertionError。\n"
+                            "必须修正验证测试后重新 create_bug_validation。"
+                        )
+
+                        print(
+                            "\n❌ 验证测试自身有错误（"
+                            + str(result.get("error_types"))
+                            + "），baseline 无效。"
+                            "必须先修正验证测试，再确认 baseline。"
+                        )
+
+                    elif validation_is_probe:
                         # 探针测试（assert False）的失败是设计使然，
                         # 只用于展示真实输出，不是有效的 Bug 复现证据
                         validation_baseline_confirmed = False
@@ -2272,11 +2588,21 @@ retrieve_code 已达上限，
                         )
 
                     else:
+                        # AssertionError 型 FAIL = 原始 Bug 成功复现。
+                        # 同时永久冻结：此后禁止重建/修改验证测试
+                        # （Runtime Guard 依据 validation_frozen 拦截），
+                        # 任何后续验证 FAIL 都只能通过修复源代码解决。
                         validation_baseline_confirmed = True
+                        validation_frozen = True
                         validation_passed = False
                         validation_failed = False
                         validation_broken = False
                         print("\n✅ 已确认原始 Bug 可以复现")
+                        print(
+                            "🔒 验证测试已冻结："
+                            "禁止重建或修改，"
+                            "后续验证失败只能修复源代码"
+                        )
 
                 elif not edited and status == "PASS":
                     validation_baseline_confirmed = False
@@ -2313,6 +2639,13 @@ retrieve_code 已达上限，
                     # 而 NO_TESTS 后 run_test 已被 Runtime 禁止，
                     # 必须在这里恢复 tests_passed，否则 DONE 永远无法达成。
                     tests_passed = True
+                    # 同理必须恢复相关测试结论：replace_lines 会把
+                    # relevant_tests_passed 重置为 False，而 NO_TESTS
+                    # 之后 run_test 被禁止、验证测试又已冻结，
+                    # 最终验证 PASS 就是"相关测试通过"的唯一证据源；
+                    # 不在这里恢复，完成条件五元组永远无法满足。
+                    relevant_tests_passed = True
+                    unrelated_test_failures = []
                     print("\n✅ 通用 Bug 回归验证通过")
 
                 else:
@@ -2321,6 +2654,13 @@ retrieve_code 已达上限，
                     # 回归验证失败：current_phase 会回退到 REPAIR 重新修改，
                     # 同步重置 tests_passed 保持状态一致，
                     # 禁止在验证未通过时声称任务完成。
+                    #
+                    # 冻结语义（requests_6629 修复核心）：
+                    # baseline 确认后，这里接收 edited 状态下的任何 FAIL
+                    # ——包括 failure_kind 为 test_error / collection_error
+                    # 的情况（验证测试已被冻结，导入错误只能来自源代码
+                    # 结构被破坏）。绝不降级为 BROKEN_TEST，绝不引导
+                    # Agent 修改验证测试；唯一出路是修复源代码。
                     tests_passed = False
                     print("\n❌ 通用 Bug 回归验证未通过：" + str(status))
 
@@ -2356,6 +2696,13 @@ retrieve_code 已达上限，
                         if not validation_created:
                             next_step = (
                                 "create_bug_validation"
+                            )
+                        elif validation_frozen:
+                            # 验证测试已冻结：验证失败只能通过修改
+                            # 源代码解决，不能引导重写验证测试
+                            # （Runtime 会拦截 create_bug_validation）
+                            next_step = (
+                                "replace_lines（修复源代码）"
                             )
                         elif (
                             validation_failed
@@ -2406,6 +2753,11 @@ retrieve_code 已达上限，
                 syntax_passed = False
                 validation_passed = False
                 validation_failed = False
+
+                # 代码已变化：上一轮的测试相关性结论全部失效，
+                # 必须重新 run_test 重新判定
+                relevant_tests_passed = False
+                unrelated_test_failures = []
 
                 # 代码已变化，重新运行测试/验证有了新意义
                 tool_call_counts.clear()
@@ -2498,6 +2850,10 @@ retrieve_code 已达上限，
                     if edited and syntax_passed:
                         no_tests_seen = True
                         tests_passed = True
+                        # 没有可运行的现有测试 = 不存在"相关测试失败"，
+                        # 相关测试视为通过，完成条件交给最终验证
+                        relevant_tests_passed = True
+                        unrelated_test_failures = []
 
                         result["guidance"] = (
                             "当前项目没有可运行的现有 pytest 测试。"
@@ -2517,8 +2873,9 @@ retrieve_code 已达上限，
 
                     else:
                         tests_passed = False
+                        relevant_tests_passed = False
 
-                if status == "PASS":
+                elif status == "PASS":
 
                     # ----------------------------------------
                     # 没有修改代码
@@ -2554,6 +2911,7 @@ retrieve_code 已达上限，
                     elif not syntax_passed:
 
                         tests_passed = False
+                        relevant_tests_passed = False
 
                         print(
                             "\n⚠️ 测试通过，"
@@ -2568,6 +2926,8 @@ retrieve_code 已达上限，
                     else:
 
                         tests_passed = True
+                        relevant_tests_passed = True
+                        unrelated_test_failures = []
 
                         print(
                             "\n✅ 测试通过"
@@ -2583,16 +2943,78 @@ retrieve_code 已达上限，
 
                 else:
 
-                    tests_passed = False
+                    # FAIL / TIMEOUT 等未通过结果：
+                    # 判定失败与本次修改的相关性。
+                    # tools 层在 FAIL 时附带 failures（失败测试条目）
+                    # 与 frame_paths（FAILURES 段 traceback 中的源码帧）。
+                    failures = result.get("failures") or []
+                    frame_paths = result.get("frame_paths") or []
 
-                    print(
-                        "\n❌ 测试未通过："
-                        f"{status}"
-                    )
+                    # 判定材料不足（非 FAIL、没有失败条目、
+                    # 会话恢复后丢失被修改文件）时，
+                    # 保守按"相关失败"处理，绝不放过该阻断的情况。
+                    failure_is_relevant = True
+
+                    if failures and last_edited_file:
+                        # 被修改文件出现在任何一个失败的 traceback
+                        # 调用链里 → 失败与本次修改相关；
+                        # 一个都不出现 → 同进程 pytest 语义下
+                        # 本次修改不可能导致这些失败 → 无关失败。
+                        failure_is_relevant = any(
+                            _frame_matches_edited_file(
+                                frame, last_edited_file
+                            )
+                            for frame in frame_paths
+                        )
+
+                    if failure_is_relevant:
+
+                        tests_passed = False
+                        relevant_tests_passed = False
+                        unrelated_test_failures = []
+
+                        result["failure_relevance"] = "RELEVANT"
+
+                        print(
+                            "\n❌ 测试未通过："
+                            f"{status}"
+                        )
+
+                    else:
+
+                        # 无关失败：只记录，不阻断完成条件。
+                        # relevant_tests_passed 置 True 的含义是
+                        # "与本次修改相关的测试子集没有失败"。
+                        tests_passed = False
+                        relevant_tests_passed = True
+                        unrelated_test_failures = [
+                            entry.get("test_id", "?")
+                            for entry in failures
+                        ]
+
+                        result["failure_relevance"] = "UNRELATED"
+
+                        result["guidance"] = (
+                            f"现有测试有 {len(unrelated_test_failures)} 个失败，"
+                            "但失败 traceback 的调用链中没有出现本次修改的文件"
+                            f"（{last_edited_file}）——"
+                            "这些失败与本次修改无关，不阻断修复流程。\n"
+                            "不要修复这些无关失败，更不要修改对应测试。\n"
+                            "下一步：继续 Bug 验证流程"
+                            "（最终验证 run_bug_validation）。"
+                        )
+
+                        print(
+                            "\n⚠️ 测试存在失败，"
+                            "但均与本次修改无关"
+                            f"（{len(unrelated_test_failures)} 个），"
+                            "不阻断修复，继续最终验证"
+                        )
 
             else:
 
                 tests_passed = False
+                relevant_tests_passed = False
 
         # ====================================================
         # 连续失败计数：结果以“工具执行失败”开头视为失败
@@ -2822,7 +3244,7 @@ check_syntax
     elif (
         edited
         and syntax_passed
-        and not tests_passed
+        and not relevant_tests_passed
         and no_tests_seen
     ):
 
@@ -2871,7 +3293,7 @@ run_bug_validation
     elif (
         edited
         and syntax_passed
-        and tests_passed
+        and relevant_tests_passed
         and validation_created
         and not validation_passed
     ):
@@ -2904,7 +3326,8 @@ else:
         "\n========== 达到最大轮数 =========="
     )
 
-    if (edited and syntax_passed and tests_passed and validation_created
+    if (edited and syntax_passed and relevant_tests_passed
+                and validation_created
                 and validation_baseline_confirmed and validation_passed):
 
         print(
