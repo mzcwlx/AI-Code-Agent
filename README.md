@@ -22,18 +22,43 @@ LOCALIZE ──→ VALIDATE ──→ REPAIR ──→ TEST ──→ FINAL_VALI
 | 阶段 | 允许的工具 | 完成条件 |
 |---|---|---|
 | LOCALIZE | `list_files` `retrieve_code` `read_file` | 定位到可疑代码（evidence ready） |
-| VALIDATE | + `create_bug_validation` `run_bug_validation` | 回归测试创建成功且 baseline 复现（FAIL） |
+| VALIDATE | + `create_bug_validation` `run_bug_validation` | 回归测试创建成功且 baseline 复现（FAIL），确认后验证测试永久冻结 |
 | REPAIR | + `replace_lines`（- `run_test`） | 源码被真实修改（edited） |
-| TEST | + `check_syntax` `run_test` | 语法 PASS + 项目测试 PASS |
-| FINAL_VALIDATE | `run_bug_validation`（失败可回退迭代修复） | 修改后回归测试 PASS |
+| TEST | + `check_syntax` `run_test` | 语法 PASS + 相关测试通过（无关失败不阻断） |
+| FINAL_VALIDATE | 仅 `run_bug_validation`（失败回退 REPAIR 重新改码） | 修改后回归测试 PASS |
 | DONE | （无） | 6 个状态位全部为真 |
 
 **DONE 判定条件（缺一不可，全部来自真实执行结果）：**
 
 ```
-edited ∧ syntax_passed ∧ tests_passed ∧ validation_created
-      ∧ baseline_confirmed ∧ validation_passed
+edited ∧ syntax_passed ∧ relevant_tests_passed
+      ∧ validation_created ∧ validation_baseline_confirmed
+      ∧ validation_passed
 ```
+
+其中 `relevant_tests_passed` 表示"与本次修改相关的测试全部通过"：
+`run_test` 失败时 Runtime 比对失败 traceback 调用链与被修改文件，调用链不含
+被修改文件的失败记为 `unrelated_test_failures`（如 581 passed / 1 unrelated
+failed 的场景），不阻断完成；项目没有现有 pytest（`NO_TESTS`）时同样视为
+通过，直接进入最终回归验证。
+
+## Bug Validation 生命周期
+
+回归测试一经 baseline 确认即永久冻结，之后不可重建、不可修改：
+
+- **baseline 之前**：验证测试自身有问题（collect 失败、非 AssertionError 崩溃）
+  判为 BROKEN_TEST，Agent 必须重写；只有 AssertionError 型 FAIL 才算有效复现。
+- **baseline 确认**：FAIL 属实的那一刻 `validation_frozen` 置真——全流程唯一
+  写入点，后续任何状态流转都不回退。
+- **冻结之后**：任何 FAIL 都只是"Bug 复现"的证据，不再回到 BROKEN_TEST。
+  Runtime Guard 两级拦截：
+  1. `create_bug_validation` 直接拒绝，返回固定文案"Bug validation 已完成
+     baseline 并被冻结，禁止重新创建或修改验证测试。最终验证失败必须修复源代码。"
+  2. `replace_lines` 等编辑工具指向验证测试文件路径时，返回"禁止用编辑工具修改验证测试文件"。
+
+Guard 先于阶段工具白名单生效，拦截（BLOCKED）不重置任何状态位；System Prompt、
+状态块、next_required_action、工具白名单四处口径一致，不会出现"Prompt 说可以、
+Runtime 又禁止"的矛盾。
 
 ## 架构
 
@@ -140,8 +165,8 @@ AI-Code-Agent/
 | `replace_lines` | 按行号区间修改真实源码（成功后清除读取缓存） |
 | `check_syntax` | 语法检查（py_compile） |
 | `run_test` | 在任务 venv 中运行 pytest |
-| `create_bug_validation` | 创建回归测试（创建时预检：collect-only 捕获导入/语法错误；识别探针测试） |
-| `run_bug_validation` | 运行回归测试（baseline 复现 / 最终验证共用） |
+| `create_bug_validation` | 创建回归测试（创建时预检：collect-only 捕获导入/语法错误；识别探针测试）；baseline 确认后拒绝创建（validation 已冻结） |
+| `run_bug_validation` | 运行回归测试（baseline 复现 / 最终验证共用）；冻结后 FAIL 只作复现证据，不再判 BROKEN_TEST |
 
 ## 验证案例：requests JSONDecodeError pickle Bug
 
@@ -180,16 +205,12 @@ class JSONDecodeError(InvalidJSONError, CompatJSONDecodeError):
    不允许假装成功。
 4. **防循环** — 相同参数的重复调用（含失败调用）计数拦截；相同范围重复 `read_file` 直接返回提示。
 5. **断点恢复** — 每轮保存会话，LLM API 中断后可从断点继续（自动修复悬空 tool_calls）。
-6. **不碰测试** — Agent 只修改源码，禁止通过改测试/删测试"通过验收"。
+6. **不碰测试** — Agent 只修改源码，禁止通过改测试/删测试"通过验收"；
+   baseline 确认后验证测试永久冻结，重建或修改验证测试都会被 Runtime Guard 拦截。
 
 ## 已知限制
 
-- 无自带测试的项目：`run_test` 返回 `NO_TESTS` 时 `tests_passed` 无法置真，
-  Agent 能完成修复与回归验证但到不了 DONE。
+- 无自带测试的项目：`run_test` 返回 `NO_TESTS` 时跳过项目测试、直接进入最终
+  回归验证（仍可到达 DONE），代价是没有项目级测试兜底。
 - 全量测试需要外部服务（如 httpbin）时，Agent 选择相关子集（`-k`）运行。
 - GitHub Issue 入口使用未认证 API（每小时 60 次请求限制）。
-
-## 安全提示
-
-`llm_client.py` 中的 API key 当前为硬编码，公开分发前请改为环境变量读取，
-并在 `.gitignore` 中排除敏感配置。
