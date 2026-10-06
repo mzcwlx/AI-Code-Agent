@@ -829,9 +829,12 @@ run_test
 4. 成功调用 replace_lines
 5. replace_lines 返回成功
 6. 修改后的代码通过 check_syntax
-7. 修改后的代码经过真实 run_test
-8. run_test 返回 PASS
-9. 测试与问题直接相关
+7. 修改后的代码经过测试阶段：
+   - 如果项目存在相关 pytest，则 run_test 必须 PASS；
+   - 如果项目没有现有测试，则 run_test 返回 NO_TESTS，
+     不视为失败，必须由 run_bug_validation 完成最终验证。
+8. 最终 run_bug_validation 必须 PASS。
+9. 测试或验证必须与问题直接相关。
 10. 没有修改 tests
 
 才能宣布：
@@ -2372,6 +2375,27 @@ retrieve_code 已达上限，
                     "status"
                 )
 
+                if status == "NO_TESTS":
+
+                    if edited and syntax_passed and validation_created:
+                        tests_passed = True
+
+                        result["guidance"] = (
+            "当前项目没有可运行的现有 pytest 测试。"
+            "这不表示代码修复失败。"
+            "项目测试阶段视为完成。"
+            "现在必须调用 run_bug_validation，"
+            "验证修改后的真实代码。"
+        )
+
+                        print(
+            "\n⚠️ 项目没有现有测试，"
+            "转入最终 Bug 回归验证"
+        )
+
+                    else:
+                        tests_passed = False
+
                 if status == "PASS":
 
                     # ----------------------------------------
@@ -2676,19 +2700,25 @@ check_syntax
     elif edited and syntax_passed and not tests_passed:
 
         messages.append(
-            {
-                "role": "user",
-                "content": """
+    {
+        "role": "user",
+        "content": """
 代码已经修改，并且语法检查通过。
 
-现在必须调用：
+现在必须完成测试阶段：
 
-run_test
+1. 如果 Workspace 中存在与 Bug 直接相关的现有 pytest，
+   调用 run_test。
+2. 如果 run_test 返回 NO_TESTS，
+   不要继续猜测测试文件或重复调用 run_test。
+   当前项目没有现有测试，这是允许的情况。
+3. 此时应直接调用 run_bug_validation，
+   用已经创建的临时 Bug 回归测试验证修改后的真实代码。
 
-使用与问题直接相关的测试。
+不要因为 NO_TESTS 无限寻找不存在的测试。
 """
-            }
-        )
+    }
+)
 
     elif (
         edited

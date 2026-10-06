@@ -3,6 +3,7 @@ import shutil
 import stat
 import subprocess
 import time
+import sys
 
 
 WORKSPACE_ROOT = "workspaces"
@@ -62,7 +63,7 @@ def prepare_workspace(workspace):
         print("未找到虚拟环境，正在创建 .venv...")
 
         run_command(
-            ["python", "-m", "venv", ".venv"],
+            [sys.executable, "-m", "venv", ".venv"],
             cwd=workspace
         )
 
