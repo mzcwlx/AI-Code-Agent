@@ -4,10 +4,15 @@ import stat
 import subprocess
 import time
 import sys
+import zipfile
 
 
 WORKSPACE_ROOT = "workspaces"
 WORKSPACE_TTL_HOURS = 24  # workspace 保留时长（小时），超过后自动删除
+
+# GitHub 仓库 ZIP 下载超时（秒）。
+# 仅用于 GitHub API 下载仓库 ZIP，与 LLM 的 timeout / retry 完全无关。
+GITHUB_ZIP_TIMEOUT = 120
 
 
 def run_command(command, cwd=None):
@@ -151,6 +156,104 @@ def cleanup_stale_workspaces(ttl_hours=WORKSPACE_TTL_HOURS,
     return deleted
 
 
+def _download_repo_zip(repo, base_commit, zip_path):
+    """通过 GitHub API 下载指定 base_commit 的仓库 ZIP。
+
+    服务器无法稳定访问 https://github.com（git clone 不可用），
+    但 https://api.github.com 已在服务器上验证可访问，
+    因此改用 curl 下载 zipball。
+
+    注意：URL 里必须用 base_commit，而不是 main，
+    保证拿到的是 benchmark 指定版本的代码。
+    """
+    zip_url = f"https://api.github.com/repos/{repo}/zipball/{base_commit}"
+
+    run_command([
+        "curl",
+        "-4",                        # 只走 IPv4
+        "-L",                        # 跟随重定向
+        "--fail",                    # HTTP 错误（如 404/422）直接非 0 退出
+        "--silent", "--show-error",  # 不刷进度条，但保留错误信息
+        "--max-time", str(GITHUB_ZIP_TIMEOUT),
+        "-H", "Accept: application/vnd.github+json",
+        "-o", zip_path,
+        zip_url,
+    ])
+
+    # curl 成功但内容异常（例如被代理劫持返回 HTML）时兜底拦截
+    if not os.path.isfile(zip_path) or os.path.getsize(zip_path) == 0:
+        raise RuntimeError(f"GitHub ZIP 下载失败（文件为空）：{zip_url}")
+
+    if not zipfile.is_zipfile(zip_path):
+        raise RuntimeError(f"GitHub ZIP 下载失败（内容不是有效 ZIP）：{zip_url}")
+
+
+def _extract_repo_zip(zip_path, workspace, extract_dir):
+    """解压 GitHub ZIP，并把唯一顶层目录的内容复制到 workspace 根目录。
+
+    GitHub zipball 解压后不是直接散开在根目录，而是包在
+    "owner-repo-xxxxxxxx/" 这样的唯一顶层目录里。
+    必须拆掉这一层，最终结果是：
+
+    workspace/
+        file1
+        file2
+        ...
+    """
+    # 清理上次异常退出可能残留的解压目录，避免旧文件混入
+    if os.path.isdir(extract_dir):
+        _rmtree_force(extract_dir)
+
+    os.makedirs(extract_dir, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(extract_dir)
+
+    entries = os.listdir(extract_dir)
+
+    if len(entries) != 1:
+        raise RuntimeError(
+            f"ZIP 结构异常：期望唯一顶层目录，实际包含：{entries}"
+        )
+
+    top_dir = os.path.join(extract_dir, entries[0])
+
+    if not os.path.isdir(top_dir):
+        raise RuntimeError(f"ZIP 结构异常：顶层不是目录：{entries[0]}")
+
+    os.makedirs(workspace, exist_ok=False)
+
+    for name in os.listdir(top_dir):
+        shutil.move(
+            os.path.join(top_dir, name),
+            os.path.join(workspace, name)
+        )
+
+
+def _init_local_git_baseline(workspace):
+    """把 ZIP 源码变成可用于 git diff / 状态管理的本地 Git 仓库。
+
+    ZIP 不带 .git，但系统后续依赖 git diff / git status /
+    修复 diff 等，因此本地重新 git init 并提交基线。
+
+    - 不添加 GitHub remote，之后也不会访问 github.com；
+    - 用 git -c 临时配置 user.name / user.email，
+      不修改服务器的全局 Git 配置。
+    """
+    run_command(["git", "init"], cwd=workspace)
+    run_command(["git", "add", "-A"], cwd=workspace)
+    run_command(
+        [
+            "git",
+            "-c", "user.name=AI-Code-Agent",
+            "-c", "user.email=ai-code-agent@localhost",
+            "commit",
+            "-m", "Initial workspace",
+        ],
+        cwd=workspace
+    )
+
+
 def create_workspace(repo, base_commit, instance_id):
     os.makedirs(WORKSPACE_ROOT, exist_ok=True)
 
@@ -166,25 +269,57 @@ def create_workspace(repo, base_commit, instance_id):
         prepare_workspace(workspace)
         return workspace
 
-    repo_url = f"https://github.com/{repo}.git"
+    # 临时文件：下载的 ZIP 和解压目录（点前缀，处理完成后立即删除，
+    # 不作为永久文件留在 WORKSPACE_ROOT）
+    zip_path = os.path.join(WORKSPACE_ROOT, f".{instance_id}.zip")
+    extract_dir = os.path.join(WORKSPACE_ROOT, f".{instance_id}_extract")
 
-    print(f"正在克隆仓库：{repo}")
+    print(f"正在下载仓库：{repo}")
+    print(f"目标版本：{base_commit}")
 
-    run_command([
-        "git",
-        "clone",
-        repo_url,
-        workspace
-    ])
+    try:
+        # 1. GitHub API 下载指定 base_commit 的 ZIP
+        #    （服务器无法 git clone github.com，api.github.com 已验证可用）
+        _download_repo_zip(repo, base_commit, zip_path)
 
-    print(f"正在切换到版本：{base_commit}")
+        print("GitHub 仓库下载完成")
 
-    run_command(
-        ["git", "checkout", base_commit],
-        cwd=workspace
-    )
+        # 2. 解压，把源码复制到 workspace 根目录（拆掉 zipball 顶层目录）
+        print("正在解压...")
+        _extract_repo_zip(zip_path, workspace, extract_dir)
 
-    print(f"Workspace 创建完成：{workspace}")
+        # 3. 重建本地 Git 基线（ZIP 不带 .git，但系统依赖 git diff）
+        _init_local_git_baseline(workspace)
+
+        print(f"Workspace 创建完成：{workspace}")
+    except Exception as e:
+        # 清理所有半成品：
+        # 临时 ZIP / 临时解压目录 / 未完成的 workspace 全部删除，
+        # 抛出明确异常。绝不能留下半成品 workspace，
+        # 否则下次 os.path.exists(workspace) 会误判为已创建成功。
+        for path in (extract_dir, workspace):
+            if os.path.isdir(path):
+                _rmtree_force(path)
+
+        if os.path.isfile(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+        raise RuntimeError(
+            f"创建 Workspace 失败（{repo} @ {base_commit}）：{e}"
+        ) from e
+    finally:
+        # 正常路径也要立即清掉临时文件
+        if os.path.isdir(extract_dir):
+            _rmtree_force(extract_dir)
+
+        if os.path.isfile(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
 
     prepare_workspace(workspace)
 

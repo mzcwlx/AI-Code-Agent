@@ -128,6 +128,11 @@ validation_failed = False
 validation_broken = False
 validation_is_probe = False
 
+# run_test 是否返回过 NO_TESTS（项目没有可运行的现有 pytest 测试）。
+# NO_TESTS ≠ 修复失败：一旦为 True，Runtime 禁止再次调用 run_test，
+# 测试阶段视为完成，最终验证交给 run_bug_validation。
+no_tests_seen = False
+
 # 当前修改后的文件
 last_edited_file = None
 
@@ -886,7 +891,7 @@ run_test
 2. 修改前运行验证，确认原始 Bug FAIL；
 3. 修改真实源代码；
 4. check_syntax；
-5. run_test；
+5. run_test（若返回 NO_TESTS，按“十六、NO_TESTS 的行为规则”处理）；
 6. 再次运行同一个临时验证，必须 PASS。
 
 临时验证不得绑定任何固定仓库、Issue 编号、类名、函数名或文件路径。
@@ -906,6 +911,33 @@ run_test
 - 为了验证序列化而使用无法被 pickle 的局部类；
 - 为了验证异常而自行假设新的异常消息；
 这些都属于与目标 Bug 无关的过度断言，除非 problem statement 明确要求。
+
+============================================================
+十六、NO_TESTS 的行为规则
+============================================================
+
+如果 run_test 返回 NO_TESTS：
+
+1. NO_TESTS 表示当前项目没有可运行的现有 pytest 测试。
+2. NO_TESTS 不是修复失败，不等于 FAIL。
+3. 禁止再次调用 run_test。
+4. 禁止猜测、寻找或虚构 test.py / test_bug.py / tests/ / test_*.py
+   等不存在的测试文件。
+5. 如果代码已经修改成功并且 check_syntax 通过，
+   必须立即调用 run_bug_validation 进行最终 Bug 回归验证。
+6. 最终任务是否成功，以 run_bug_validation 的真实返回结果为准，
+   不以你自己的文字描述为准。
+   你说“已经修复”“代码看起来正确”“应该已经解决”
+   都不能作为任务完成的依据。
+
+英文规则（与上述规则同等效力）：
+
+NO_TESTS means that the project has no runnable existing pytest tests.
+It is not a repair failure.
+After receiving NO_TESTS, do not call run_test again.
+Do not guess or invent test files.
+If the code has been modified and syntax validation passed, immediately call run_bug_validation.
+The final success decision must be based on the actual result of run_bug_validation, not on the model's textual claim.
 
 
 """
@@ -977,6 +1009,13 @@ if resumed_session is not None:
     # 旧版本会话文件没有该字段，默认 False
     globals()["validation_is_probe"] = saved_state.get(
         "validation_is_probe",
+        False
+    )
+
+    # 旧版本会话文件没有 no_tests_seen 字段，默认 False，
+    # 保证恢复后 NO_TESTS → 禁止 run_test 的规则仍然生效
+    globals()["no_tests_seen"] = saved_state.get(
+        "no_tests_seen",
         False
     )
 
@@ -1165,6 +1204,10 @@ def current_phase():
         and validation_passed
     ):
         return "DONE"
+    if edited and syntax_passed and validation_failed:
+        # 最终回归验证失败：回到 REPAIR 重新修改代码，
+        # 禁止停留在 TEST / FINAL_VALIDATE 原地重复验证。
+        return "REPAIR"
     if (
         edited
         and syntax_passed
@@ -1172,6 +1215,11 @@ def current_phase():
         and validation_created
         and validation_baseline_confirmed
     ):
+        return "FINAL_VALIDATE"
+    if edited and syntax_passed and no_tests_seen:
+        # run_test 已返回 NO_TESTS：项目没有可运行的现有 pytest 测试，
+        # 测试阶段视为完成，直接进入最终 Bug 回归验证，
+        # 禁止停留在 TEST 阶段反复 run_test。
         return "FINAL_VALIDATE"
     if edited and syntax_passed:
         return "TEST"
@@ -1188,6 +1236,13 @@ def next_required_action():
     """把 Runtime 已知状态转换成唯一的优先动作。"""
     if edited and syntax_passed and tests_passed and validation_passed:
         return "STOP: 已满足完成条件，不再调用工具。"
+    if edited and syntax_passed and validation_failed:
+        # 最终回归验证失败：必须重新修改代码，而不是重复运行验证
+        return "replace_lines（回归验证失败，重新修改代码）"
+    if edited and syntax_passed and not tests_passed and no_tests_seen:
+        # NO_TESTS：项目没有现有 pytest 测试，禁止 run_test，
+        # 直接进行最终 Bug 回归验证
+        return "run_bug_validation"
     if edited and syntax_passed and tests_passed and validation_created and not validation_passed:
         return "run_bug_validation"
     if edited and syntax_passed and not tests_passed:
@@ -1219,11 +1274,13 @@ def allowed_tools_for_phase():
         "LOCALIZE": {"list_files", "retrieve_code", "read_file"},
         "VALIDATE": {"read_file", "create_bug_validation", "run_bug_validation"},
         "REPAIR": {"read_file", "replace_lines", "check_syntax"},
-        "TEST": {"read_file", "replace_lines", "check_syntax", "run_test"},
-        "FINAL_VALIDATE": {
+        "TEST": {
             "read_file", "replace_lines", "check_syntax",
             "run_test", "run_bug_validation",
         },
+        # FINAL_VALIDATE 只允许 run_bug_validation：
+        # NO_TESTS 之后继续 run_test / 猜测试文件 / 反复改代码都被禁止。
+        "FINAL_VALIDATE": {"run_bug_validation"},
         "DONE": set(),
     }
     return mapping.get(phase, set())
@@ -1256,6 +1313,7 @@ tests_passed: {tests_passed}
 validation_failed: {validation_failed}
 validation_broken: {validation_broken}
 validation_passed: {validation_passed}
+no_tests_seen: {no_tests_seen}
 
 已读取文件：
 {read_text}
@@ -1311,6 +1369,7 @@ for round_number in range(start_round, MAX_ROUNDS):
             "validation_failed": validation_failed,
             "validation_broken": validation_broken,
             "validation_is_probe": validation_is_probe,
+            "no_tests_seen": no_tests_seen,
             "evidence_ready": evidence_ready,
             "retrieve_count": retrieve_count,
             "consecutive_reads": consecutive_reads,
@@ -1537,10 +1596,31 @@ run_test
 2. 必要时 retrieve_code 定位相关代码；
 3. 调用 replace_lines 修正真正的缺陷；
 4. check_syntax；
-5. run_test；
+5. run_test（若 run_test 曾返回 NO_TESTS，跳过此步并禁止再调用）；
 6. 最后再次 run_bug_validation。
 
 禁止修改 tests。
+"""
+
+        elif (
+            edited
+            and syntax_passed
+            and not tests_passed
+            and no_tests_seen
+        ):
+
+            continuation = """
+当前项目没有可运行的现有 pytest 测试（run_test 已返回 NO_TESTS）。
+
+NO_TESTS 不表示修复失败。
+禁止再次调用 run_test，禁止猜测或寻找不存在的测试文件。
+
+重新修改并通过语法检查后，现在必须直接调用：
+
+run_bug_validation
+
+最终任务是否成功，以 run_bug_validation 的真实返回结果为准。
+不要结束任务。
 """
 
         elif edited and syntax_passed and not tests_passed:
@@ -2041,6 +2121,29 @@ retrieve_code 已达上限，
                             "禁止修改后跳过语法检查"
                         )
 
+                    elif (
+                        tool_name == "run_test"
+                        and no_tests_seen
+                    ):
+
+                        result = {
+                            "status": "BLOCKED",
+                            "message": (
+                                "run_test 此前已返回 NO_TESTS："
+                                "项目没有可运行的现有 pytest 测试。\n"
+                                "NO_TESTS 不是修复失败，"
+                                "但禁止再次调用 run_test，"
+                                "禁止猜测或寻找 test.py / tests/ 等测试文件。\n"
+                                "必须立即调用 run_bug_validation，"
+                                "验证修改后的真实代码。"
+                            )
+                        }
+
+                        print(
+                            "\n⚠️ Runtime Guard："
+                            "NO_TESTS 后禁止再次调用 run_test"
+                        )
+
                     else:
 
                         result = tool(
@@ -2205,11 +2308,20 @@ retrieve_code 已达上限，
                 elif edited and status == "PASS":
                     validation_passed = True
                     validation_failed = False
+                    # 最终回归验证 PASS 即视为测试阶段完成：
+                    # 重新修改代码后 tests_passed 会被 replace_lines 重置，
+                    # 而 NO_TESTS 后 run_test 已被 Runtime 禁止，
+                    # 必须在这里恢复 tests_passed，否则 DONE 永远无法达成。
+                    tests_passed = True
                     print("\n✅ 通用 Bug 回归验证通过")
 
                 else:
                     validation_passed = False
                     validation_failed = True
+                    # 回归验证失败：current_phase 会回退到 REPAIR 重新修改，
+                    # 同步重置 tests_passed 保持状态一致，
+                    # 禁止在验证未通过时声称任务完成。
+                    tests_passed = False
                     print("\n❌ 通用 Bug 回归验证未通过：" + str(status))
 
         # ====================================================
@@ -2377,21 +2489,31 @@ retrieve_code 已达上限，
 
                 if status == "NO_TESTS":
 
-                    if edited and syntax_passed and validation_created:
+                    # NO_TESTS ≠ 修复失败：
+                    # 它只说明项目没有可运行的现有 pytest 测试。
+                    # 修改后代码一旦通过语法检查，测试阶段立即视为完成，
+                    # Runtime 直接进入 FINAL_VALIDATE，
+                    # 之后由守卫禁止再次调用 run_test。
+
+                    if edited and syntax_passed:
+                        no_tests_seen = True
                         tests_passed = True
 
                         result["guidance"] = (
-            "当前项目没有可运行的现有 pytest 测试。"
-            "这不表示代码修复失败。"
-            "项目测试阶段视为完成。"
-            "现在必须调用 run_bug_validation，"
-            "验证修改后的真实代码。"
-        )
+                            "当前项目没有可运行的现有 pytest 测试。"
+                            "这不表示代码修复失败。"
+                            "项目测试阶段视为完成。"
+                            "禁止再次调用 run_test，"
+                            "禁止猜测或寻找不存在的测试文件。\n"
+                            "现在必须立即调用 run_bug_validation，"
+                            "验证修改后的真实代码。"
+                            "最终成功以 run_bug_validation 的真实结果为准。"
+                        )
 
                         print(
-            "\n⚠️ 项目没有现有测试，"
-            "转入最终 Bug 回归验证"
-        )
+                            "\n⚠️ 项目没有现有测试，"
+                            "转入最终 Bug 回归验证"
+                        )
 
                     else:
                         tests_passed = False
@@ -2689,13 +2811,39 @@ check_syntax
 
 修改后重新执行：
 check_syntax
-→ run_test
+→ run_test（若 run_test 曾返回 NO_TESTS，跳过此步并禁止再调用）
 → run_bug_validation
 
 不要修改 tests。
 """
             }
         )
+
+    elif (
+        edited
+        and syntax_passed
+        and not tests_passed
+        and no_tests_seen
+    ):
+
+        messages.append(
+    {
+        "role": "user",
+        "content": """
+当前项目没有可运行的现有 pytest 测试（run_test 已返回 NO_TESTS）。
+
+NO_TESTS 不表示修复失败。
+禁止再次调用 run_test，禁止猜测或寻找不存在的测试文件。
+
+重新修改并通过语法检查后，现在必须直接调用：
+
+run_bug_validation
+
+最终任务是否成功，以 run_bug_validation 的真实返回结果为准。
+不要结束任务。
+"""
+    }
+)
 
     elif edited and syntax_passed and not tests_passed:
 
